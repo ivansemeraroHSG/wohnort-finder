@@ -1,0 +1,3 @@
+Hier kommen die Original-Downloads hin (CSV, Excel, GeoJSON).
+Diese Dateien nie von Hand ändern. Bereinigt wird in scripts/build_db.py.
+Pro Datei im README die Quelle, den Link und den Stand notieren.
