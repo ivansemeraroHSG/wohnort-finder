@@ -3,6 +3,7 @@ api.py – Arbeitsort und Pendeln: Koordinaten, Pendelzeiten und Pendelkosten (A
 
 Verantwortlich: Gregor Weber
 Mit Claude erstellt, angepasst von Gregor Weber
+Fusswege zum/vom ÖV, Abo-Wahl, Lieblings-Verkehrsmittel (20.11.): mit Claude erstellt, angepasst von Ivan
 
 Genutzte APIs (alle kostenlos):
 - swisstopo SearchServer:  Adresse -> Koordinaten
@@ -52,6 +53,15 @@ KEINE_VERBINDUNG = -1
 # Zum Namen findet der Fahrplan manchmal einen anderen Ort ("Herdern" -> Zürich, Herdernstrasse).
 # 15 km, weil auch in den grössten Gemeinden das Dorf höchstens so weit vom Mittelpunkt liegt.
 MAX_ABSTAND_HALTESTELLE_KM = 15
+# Fusswege: Der Fahrplan rechnet nur von Haltestelle zu Haltestelle (Umsteigezeiten sind
+# darin schon enthalten). Dazu kommen der Weg von zu Hause zur Haltestelle und von der
+# Ziel-Haltestelle zum Arbeitsort.
+ZUGANG_START_MIN = 5    # Annahme: von zu Hause zur Haltestelle (genaue Adresse kennen wir nicht)
+GEHTEMPO_KMH = 4.5
+UMWEG_FUSS = 1.3        # Fussweg ist länger als die Luftlinie
+MAX_FUSSWEG_MIN = 30    # weiter läuft niemand; dann stimmt die gefundene Haltestelle nicht
+# Cache-Version: ältere Einträge enthalten die Fusswege noch nicht und werden nicht verwendet
+CACHE_VERSION = "v2"
 
 # --- Auto und Velo ---
 PROFIL_AUTO = "driving-car"
@@ -140,6 +150,7 @@ def live_minuten(start: str, ziel: str,
     Rückgabe: Minuten, KEINE_VERBINDUNG (dauerhaft) oder None (API gerade nicht erreichbar).
     """
     params = {"from": start, "to": ziel, "date": naechster_montag(), "time": ABFAHRT, "limit": 1}
+    ziel_lat, ziel_lon = (float(wert) for wert in ziel.split(","))
     try:
         r = requests.get(TRANSPORT_URL, params=params, timeout=TIMEOUT_SEK)
     except requests.exceptions.RequestException:
@@ -157,7 +168,16 @@ def live_minuten(start: str, ziel: str,
             abstand = haversine_km(pruef_lat, pruef_lon, haltestelle["x"], haltestelle["y"])
             if abstand > MAX_ABSTAND_HALTESTELLE_KM:
                 return KEINE_VERBINDUNG
-    return dauer_in_minuten(verbindung["duration"])
+    return dauer_in_minuten(verbindung["duration"]) + ZUGANG_START_MIN + fussweg_minuten(verbindung, ziel_lat, ziel_lon)
+
+
+def fussweg_minuten(verbindung: dict, ziel_lat: float, ziel_lon: float) -> int:
+    """Gehzeit von der Ziel-Haltestelle zum Arbeitsort in Minuten."""
+    haltestelle = verbindung["to"]["station"]["coordinate"]   # x = lat, y = lon
+    if haltestelle["x"] is None:
+        return 0
+    km = haversine_km(haltestelle["x"], haltestelle["y"], ziel_lat, ziel_lon) * UMWEG_FUSS
+    return min(round(km / GEHTEMPO_KMH * 60), MAX_FUSSWEG_MIN)
 
 
 def commute_minutes(ziel_lat: float, ziel_lon: float,
@@ -188,6 +208,7 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
 
     # Schritt 2: Welche Gemeinden live abfragen?
     ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
+    cache_ziel = f"{ziel}|{CACHE_VERSION}"
     abfragen = resultat.sort_values("km").head(max_abfragen)
     if zusaetzlich is not None:
         extra = resultat[resultat["bfs_nr"].isin(zusaetzlich)]
@@ -197,7 +218,7 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
     # Aufrufen (z. B. Runden in app.py). Live gefragt wird nur, was dort fehlt.
     con = get_cache_connection()
     cache = pd.read_sql("SELECT bfs_nr, minuten FROM pendel_cache WHERE ziel = ?",
-                        con, params=(ziel,))
+                        con, params=(cache_ziel,))
     bekannt = dict(zip(cache["bfs_nr"], cache["minuten"]))   # bfs_nr -> minuten
 
     fehler_in_folge = 0
@@ -223,7 +244,7 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
                 with con:
                     con.execute(
                         "INSERT OR REPLACE INTO pendel_cache (bfs_nr, ziel, minuten) VALUES (?, ?, ?)",
-                        (bfs_nr, ziel, minuten),
+                        (bfs_nr, cache_ziel, minuten),
                     )
             time.sleep(PAUSE_SEK)
 
@@ -342,12 +363,14 @@ def route_matrix(ziel_lat: float, ziel_lon: float,
     return resultat.reset_index()
 
 
-def bestes_verkehrsmittel(optionen: dict, max_min: float, zeitwert: float | None) -> str | None:
+def bestes_verkehrsmittel(optionen: dict, max_min: float, zeitwert: float | None,
+                          lieblings_vm: str | None = None, toleranz_min: float = 0) -> str | None:
     """
     Bestes Verkehrsmittel aus {"oev": (minuten, chf), ...}.
 
     Ohne Zeitwert das günstigste, sonst das mit den tiefsten Kosten + Zeitwert × Minuten;
-    nur bis max_min. Ist keins schnell genug, das schnellste.
+    nur bis max_min. Ist keins schnell genug, das schnellste. Hat die Nutzerin ein
+    Lieblings-Verkehrsmittel, gewinnt es, solange es höchstens toleranz_min länger dauert.
     """
     bestes = None
     beste_punkte = None
@@ -368,6 +391,13 @@ def bestes_verkehrsmittel(optionen: dict, max_min: float, zeitwert: float | None
         for vm in optionen:
             if bestes is None or optionen[vm][0] < optionen[bestes][0]:
                 bestes = vm
+        return bestes
+
+    # Vorliebe der Nutzerin (direkte Eingabe in app.py, nicht Teil des ML-Modells)
+    if lieblings_vm in optionen and lieblings_vm != bestes:
+        lieblings_min = optionen[lieblings_vm][0]
+        if lieblings_min <= max_min and lieblings_min <= optionen[bestes][0] + toleranz_min:
+            bestes = lieblings_vm
     return bestes
 
 
@@ -380,8 +410,9 @@ def pendel_optionen(gemeinden: pd.DataFrame, pendel: pd.DataFrame,
         pendel:   Ergebnis von commute_minutes() (ÖV)
         routen:   route_matrix() für Auto und Velo, verknüpft über bfs_nr
         eingaben: {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5,
-                   "hat_auto": False, "parkplatz_chf": 0, "hat_ga": False,
-                   "max_pendel_min": 45, "zeitwert": None}
+                   "hat_auto": False, "parkplatz_chf": 0, "oev_abo": "guenstigstes",
+                   "lieblings_vm": None, "toleranz_min": 0, "max_pendel_min": 45, "zeitwert": None}
+                  oev_abo: Schlüssel aus data.OEV_ABOS
                   zeitwert = CHF pro Jahr für 1 Minute pro Weg (von AP 3), None = noch keiner
 
     Rückgabe: DataFrame mit bfs_nr, oev_geschaetzt, oev/auto/velo_min und _chf,
@@ -403,10 +434,7 @@ def pendel_optionen(gemeinden: pd.DataFrame, pendel: pd.DataFrame,
         optionen = {}
         if "oev" in gewaehlt:
             # Tarif-km des Abos: Strassen-km als Näherung, die Bahn ist ähnlich lang
-            if eingaben["hat_ga"]:
-                oev_chf = 0
-            else:
-                oev_chf = oev_abopreis(g["auto_km"])
+            oev_chf = oev_abopreis(g["auto_km"], eingaben.get("oev_abo", "guenstigstes"))
             optionen["oev"] = (g["oev_min"], oev_chf)
         if "auto" in gewaehlt:
             auto_chf = g["auto_km"] * fahrten_pro_jahr * auto_chf_pro_km + MONATE * eingaben["parkplatz_chf"]
@@ -422,7 +450,8 @@ def pendel_optionen(gemeinden: pd.DataFrame, pendel: pd.DataFrame,
                 zeile[f"{vm}_min"] = None
                 zeile[f"{vm}_chf"] = None
 
-        bestes = bestes_verkehrsmittel(optionen, eingaben["max_pendel_min"], eingaben["zeitwert"])
+        bestes = bestes_verkehrsmittel(optionen, eingaben["max_pendel_min"], eingaben["zeitwert"],
+                                       eingaben.get("lieblings_vm"), eingaben.get("toleranz_min", 0))
         zeile["bestes_vm"] = bestes
         if bestes is None:   # gar kein Verkehrsmittel gewählt
             zeile["pendel_min"] = None
@@ -470,7 +499,7 @@ if __name__ == "__main__":
         route_matrix(47.378, 8.540, alle, PROFIL_VELO), on="bfs_nr")
     rj = alle[alle["name"] == "Rapperswil-Jona"]["bfs_nr"].iloc[0]
     eingaben = {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5, "hat_auto": False,
-                "parkplatz_chf": 0, "hat_ga": False, "max_pendel_min": 60, "zeitwert": None}
+                "parkplatz_chf": 0, "oev_abo": "guenstigstes", "max_pendel_min": 60, "zeitwert": None}
     erwartet = [({}, 14603), ({"hat_auto": True}, 5526), ({"hat_auto": True, "parkplatz_chf": 200}, 7926)]
     for aenderung, auto_chf in erwartet:
         e = eingaben.copy()   # copy: die Grundeingaben sollen für den nächsten Fall gleich bleiben
