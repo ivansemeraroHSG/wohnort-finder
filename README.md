@@ -4,7 +4,9 @@ Gruppenprojekt im Kurs *Fundamentals and Methods of Computer Science*, HSG, HS 2
 
 ## Problem
 
-Steuern, Miete und Pendelzeit stehen auf verschiedenen Websites. Gemeinden zu vergleichen dauert Stunden, und viele wissen nicht, welchen Trade-off sie eigentlich wollen. Die App kombiniert die drei Faktoren und lernt aus Bewertungen, was der Nutzerin wichtig ist.
+Wer einen Job in Zürich hat, fragt sich: Lohnt es sich, nach Zug oder Schwyz zu ziehen? Tiefe Steuern heissen nicht automatisch günstig wohnen, denn in Steuerparadiesen sind die Mieten oft hoch. Ob sich ein Umzug lohnt, hängt vom eigenen Einkommen und Haushalt ab und lässt sich nicht im Kopf ausrechnen: Für eine ledige Person mit 60'000 CHF ist Zug rund 3'000 CHF pro Jahr teurer als Rapperswil-Jona, bei 300'000 CHF ist Zug über 8'000 CHF günstiger.
+
+Der Wohnort-Finder rechnet für die eigene Situation die **Wohnkosten pro Jahr** (Steuern + 12 × Miete) aller 2110 Gemeinden aus, vergleicht sie mit dem heutigen Wohnort und zeigt, wie viel man spart und wie viel länger man dafür pendelt. Aus Bewertungen lernt die App, wie viel einem eine Minute Pendelzeit wert ist.
 
 ## Online-Version
 
@@ -26,10 +28,10 @@ streamlit run app.py
 | Datei | Inhalt |
 | --- | --- |
 | `app.py` | Streamlit-Oberfläche |
-| `scoring.py` | Ranking mit festen Gewichten (Fallback) |
+| `scoring.py` | Wohnkosten pro Gemeinde (Grundlage des Rankings) |
 | `data.py` | Zugriff auf die SQLite-Datenbank |
 | `api.py` | swisstopo und transport.opendata.ch |
-| `model.py` | k-means, logistische Regression, Mietmodell |
+| `model.py` | k-means, logistische Regression (Wert der Pendelzeit) |
 | `charts.py` | Karte, Scatterplot, Tabellen |
 | `scripts/steuern_laden.py` | lädt die Steuerdaten einmalig von der ESTV |
 | `scripts/grenzen_aufbereiten.py` | passt die Gemeindegrenzen an die Gemeinden 2026 an |
