@@ -12,6 +12,7 @@ Verknüpft werden sie immer über bfs_nr.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from pathlib import Path
 
@@ -25,6 +26,46 @@ DB_PATH = Path(__file__).parent / "data" / "wohnort.db"
 CACHE_PATH = Path(__file__).parent / "data" / "cache.db"
 
 HAUSHALTE = ["ledig", "verheiratet", "verheiratet_2_kinder"]
+
+# --- Kostenansätze fürs Pendeln (Task 1.7), Stand November 2026 ---
+# GA Erwachsene 2. Klasse ab Fahrplanwechsel Dezember 2026 (Alliance SwissPass / SBB)
+GA_PREIS = 4095
+# Strecken-Abo, Tarif T650 von Alliance SwissPass (Ausgabe 01.06.2026, Ziffer 4.1):
+# Grundpreis 1 Monat, Erwachsene, 2. Klasse in CHF pro km, mit Rabatt je weiter die Strecke
+STRECKENABO_CHF_PRO_KM = 17.22
+# (bis Kilometer, Anteil des Grundpreises) für jede Distanzstufe
+STRECKENABO_STAFFELUNG = [(4, 1.0), (14, 0.406), (20, 0.375), (39, 0.227), (54, 0.131), (250, 0.112)]
+# Jahres-Abo = 9 Monatspreise (T650, Ziffer 4.1.7)
+MONATE_PRO_JAHRESABO = 9
+# TCS Kilometerkosten 2026 (Musterauto, 15'000 km pro Jahr): total 74 Rp./km;
+# variable Kosten (Energie, Unterhalt, Reifen) 4'135 CHF / 15'000 km = 28 Rp./km.
+# Wer schon ein Auto hat, zahlt fürs Pendeln nur die variablen Kosten.
+AUTO_CHF_PRO_KM_VARIABEL = 0.28
+AUTO_CHF_PRO_KM_TOTAL = 0.74
+# Arbeitswochen pro Jahr (52 Wochen minus Ferien und Feiertage)
+ARBEITSWOCHEN = 46
+
+
+def oev_abopreis(km: float) -> float:
+    """
+    Preis eines Jahres-Strecken-Abos (Erwachsene, 2. Klasse) in CHF nach Tarif T650.
+
+    Parameter:
+        km: Tarifkilometer der Strecke (ungefähr die Strassendistanz, nicht die Luftlinie)
+
+    Rückgabe: Jahrespreis in CHF, höchstens der Preis des GA
+    """
+    km = max(4, math.ceil(km))   # Mindestpreis ist der Preis für 4 km
+    monatspreis = 0.0
+    bisher = 0
+    for bis_km, anteil in STRECKENABO_STAFFELUNG:
+        km_in_stufe = min(km, bis_km) - bisher
+        if km_in_stufe <= 0:
+            break
+        monatspreis += km_in_stufe * STRECKENABO_CHF_PRO_KM * anteil
+        bisher = bis_km
+    # Der Tarif rundet auf den nächsten Franken auf
+    return min(math.ceil(monatspreis) * MONATE_PRO_JAHRESABO, GA_PREIS)
 
 
 def get_connection() -> sqlite3.Connection:
