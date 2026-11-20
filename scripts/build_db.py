@@ -1,8 +1,11 @@
 """Baut die SQLite-Datenbank data/wohnort.db aus den Rohdaten in data/raw."""
+# Mit Claude erstellt, angepasst von Ivan
 #
 # Ausführen im Projektordner:  python scripts/build_db.py
 # Die Datenbank wird bei jedem Lauf komplett neu gebaut.
+# Vorher muss scripts/grenzen_aufbereiten.py gelaufen sein (für die Koordinaten).
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -11,6 +14,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "data" / "raw"
 DB = ROOT / "data" / "wohnort.db"
+GRENZEN = ROOT / "data" / "gemeindegrenzen_2026.geojson"
+
+# Kantonskürzel in der offiziellen BFS-Reihenfolge (Position = CantonId)
+KANTON_KUERZEL = [
+    "ZH", "BE", "LU", "UR", "SZ", "OW", "NW", "GL", "ZG", "FR", "SO", "BS", "BL",
+    "SH", "AR", "AI", "SG", "GR", "AG", "TG", "TI", "VD", "VS", "NE", "GE", "JU",
+]
 
 # In den BFS-Miettabellen steht neben jeder Miete ein Vertrauensintervall.
 # Zimmerzahl -> Spaltennummer der Miete (6 = "6 und mehr")
@@ -48,13 +58,40 @@ def gemeinden_laden():
         "bfs_nr": roh["BfsCode"],
         "name": roh["Name"],
         "kanton_id": roh["CantonId"],
-        "kanton": roh["Canton"],
+        "kanton": roh["CantonId"].apply(lambda nr: KANTON_KUERZEL[nr - 1]),
+        "kanton_name": roh["Canton"],
         "bezirk": roh["District"],
         "gemeindetyp": roh["GDETYP2020_9"],
         "stadt_land": roh["STALAN2020"],
     })
     gemeinden["typ_gruppe"] = gemeinden["gemeindetyp"].apply(typ_gruppe)
-    return gemeinden
+    return gemeinden.merge(mittelpunkte_laden(), on="bfs_nr", how="left")
+
+
+def mittelpunkt(ring):
+    """Schwerpunkt und Fläche eines Polygons (Liste von [lon, lat]) nach der Gauss-Formel."""
+    flaeche = sx = sy = 0.0
+    for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+        kreuz = x1 * y2 - x2 * y1
+        flaeche += kreuz
+        sx += (x1 + x2) * kreuz
+        sy += (y1 + y2) * kreuz
+    flaeche /= 2
+    return sx / (6 * flaeche), sy / (6 * flaeche), abs(flaeche)
+
+
+def mittelpunkte_laden():
+    """Koordinaten jeder Gemeinde: Schwerpunkt ihrer grössten Teilfläche."""
+    with open(GRENZEN, encoding="utf-8") as datei:
+        grenzen = json.load(datei)
+    zeilen = []
+    for gemeinde in grenzen["features"]:
+        # polygon[0] ist der Aussenrand, die weiteren Ringe wären Löcher
+        teile = [mittelpunkt(polygon[0]) for polygon in gemeinde["geometry"]["coordinates"]]
+        lon, lat, _ = max(teile, key=lambda teil: teil[2])
+        zeilen.append({"bfs_nr": gemeinde["properties"]["bfs_nr"],
+                       "lat": round(lat, 4), "lon": round(lon, 4)})
+    return pd.DataFrame(zeilen)
 
 
 def steuern_laden():
@@ -125,7 +162,8 @@ def main():
 
     # Kurze Kontrolle, ob alles zusammenpasst
     ohne_steuern = set(gemeinden["bfs_nr"]) - set(steuern["bfs_nr"])
-    print(f"Gemeinden: {len(gemeinden)}, davon ohne Gruppe: {gemeinden['typ_gruppe'].isna().sum()}")
+    print(f"Gemeinden: {len(gemeinden)}, davon ohne Gruppe: {gemeinden['typ_gruppe'].isna().sum()}, "
+          f"ohne Koordinaten: {gemeinden['lat'].isna().sum()}")
     print(f"Steuerzeilen: {len(steuern)}, Gemeinden ohne Steuerdaten: {len(ohne_steuern)}")
     print(f"Mieten Kanton: {mieten_kanton['miete_chf'].notna().sum()} Werte, "
           f"Mieten Gemeindetyp: {mieten_typ['miete_chf'].notna().sum()} Werte")

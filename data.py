@@ -1,11 +1,13 @@
 """
 data.py – Zugriff auf die SQLite-Datenbank (Arbeitspaket 1).
 
-Verantwortlich: <Name eintragen>
+Verantwortlich: Ivan
+Funktionen get_municipalities bis save_rating: mit Claude erstellt, angepasst von Ivan
 
 Alle Funktionen geben pandas-DataFrames mit den vereinbarten Spaltennamen zurück:
-bfs_nr, name, kanton, lat, lon, gemeindetyp, einwohner, steuer_chf,
+bfs_nr, name, kanton, lat, lon, gemeindetyp, steuer_chf,
 miete_chf, miete_geschaetzt, pendel_min, pendel_geschaetzt, score.
+Verknüpft werden sie immer über bfs_nr.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import pandas as pd
 # Pfad zur Datenbank (wird von scripts/build_db.py erzeugt)
 DB_PATH = Path(__file__).parent / "data" / "wohnort.db"
 
+HAUSHALTE = ["ledig", "verheiratet", "verheiratet_2_kinder"]
+
 
 def get_connection() -> sqlite3.Connection:
     """Öffnet eine Verbindung zur SQLite-Datenbank und gibt sie zurück."""
@@ -29,15 +33,22 @@ def get_municipalities() -> pd.DataFrame:
     """
     Liefert alle Gemeinden.
 
-    Rückgabe: DataFrame mit bfs_nr, name, kanton, lat, lon, gemeindetyp, einwohner
+    Rückgabe: DataFrame mit bfs_nr, name, kanton, lat, lon, gemeindetyp, typ_gruppe
     """
-    # TODO (AP 1): SQL-Abfrage auf die Tabelle "gemeinden"
-    raise NotImplementedError
+    with get_connection() as con:
+        return pd.read_sql(
+            "SELECT bfs_nr, name, kanton, lat, lon, gemeindetyp, typ_gruppe "
+            "FROM gemeinden ORDER BY name",
+            con,
+        )
 
 
 def get_tax(einkommen: int, haushalt: str) -> pd.DataFrame:
     """
     Liefert die Steuerbelastung pro Gemeinde für ein Einkommen und einen Haushaltstyp.
+
+    In der Datenbank stehen nur einige Einkommensstufen (50'000 bis 300'000 CHF).
+    Dazwischen wird linear interpoliert, ausserhalb gilt die nächste Stufe.
 
     Parameter:
         einkommen: Bruttoeinkommen in CHF pro Jahr
@@ -45,21 +56,49 @@ def get_tax(einkommen: int, haushalt: str) -> pd.DataFrame:
 
     Rückgabe: DataFrame mit bfs_nr, steuer_chf (CHF pro Jahr)
     """
-    # TODO (AP 1): Werte der nächsten Einkommensstufen lesen und linear interpolieren
-    raise NotImplementedError
+    if haushalt not in HAUSHALTE:
+        raise ValueError(f"Unbekannter Haushalt: {haushalt}")
+    with get_connection() as con:
+        steuern = pd.read_sql(
+            "SELECT bfs_nr, einkommen, steuer_chf FROM steuern WHERE haushalt = ?",
+            con,
+            params=(haushalt,),
+        )
+    # Eine Zeile pro Gemeinde, eine Spalte pro Einkommensstufe
+    tabelle = steuern.pivot(index="bfs_nr", columns="einkommen", values="steuer_chf")
+    stufen = tabelle.columns.to_numpy()
+    werte = [np.interp(einkommen, stufen, zeile) for zeile in tabelle.to_numpy()]
+    return pd.DataFrame({"bfs_nr": tabelle.index, "steuer_chf": np.round(werte)})
 
 
 def get_rent(zimmer: int) -> pd.DataFrame:
     """
     Liefert die durchschnittliche Monatsmiete pro Gemeinde für eine Zimmerzahl.
 
+    Das BFS publiziert Mieten nur pro Kanton und pro Gemeindetyp, nicht pro Gemeinde.
+    Vorläufig gilt darum der Kantonswert; fehlt er, der Wert des Gemeindetyps
+    (miete_geschaetzt = True). Das genauere Mietmodell folgt in einem späteren Task.
+
     Parameter:
-        zimmer: Anzahl Zimmer (z. B. 2, 3, 4)
+        zimmer: Anzahl Zimmer, 1 bis 6 (6 = "6 und mehr")
 
     Rückgabe: DataFrame mit bfs_nr, miete_chf (CHF pro Monat), miete_geschaetzt (bool)
     """
-    # TODO (AP 1): SQL-Abfrage auf die Tabelle "mieten"
-    raise NotImplementedError
+    zimmer = min(max(int(zimmer), 1), 6)
+    with get_connection() as con:
+        mieten = pd.read_sql(
+            """
+            SELECT g.bfs_nr, k.miete_chf AS miete_kanton, t.miete_chf AS miete_typ
+            FROM gemeinden g
+            LEFT JOIN mieten_kanton k ON k.kanton_id = g.kanton_id AND k.zimmer = ?
+            LEFT JOIN mieten_typ t ON t.typ_gruppe = g.typ_gruppe AND t.zimmer = ?
+            """,
+            con,
+            params=(zimmer, zimmer),
+        )
+    mieten["miete_geschaetzt"] = mieten["miete_kanton"].isna()
+    mieten["miete_chf"] = mieten["miete_kanton"].fillna(mieten["miete_typ"])
+    return mieten[["bfs_nr", "miete_chf", "miete_geschaetzt"]]
 
 
 def save_rating(bfs_nr: int, gefaellt: bool, sitzung: str) -> None:
@@ -71,8 +110,11 @@ def save_rating(bfs_nr: int, gefaellt: bool, sitzung: str) -> None:
         gefaellt: True = gefällt, False = gefällt nicht
         sitzung:  zufällige ID der Sitzung (keine Personendaten)
     """
-    # TODO (AP 1): INSERT in die Tabelle "bewertungen"
-    raise NotImplementedError
+    with get_connection() as con:
+        con.execute(
+            "INSERT INTO bewertungen (sitzung, bfs_nr, gefaellt) VALUES (?, ?, ?)",
+            (sitzung, int(bfs_nr), int(gefaellt)),
+        )
 
 
 def fake_municipalities(n: int = 30, seed: int = 42) -> pd.DataFrame:
