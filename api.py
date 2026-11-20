@@ -16,6 +16,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import requests
+import streamlit as st
 
 from data import get_connection
 
@@ -36,6 +37,10 @@ PENDEL_B = 0.76
 KEINE_VERBINDUNG = -1
 
 
+# Streamlit führt app.py bei jedem Klick neu aus. Ohne Cache würde dieselbe
+# Adresse jedes Mal neu bei swisstopo gesucht. ttl=600: nach 10 Minuten neu fragen,
+# damit ein Ergebnis aus einer kurzen Störung (None) nicht ewig hängen bleibt.
+@st.cache_data(ttl=600)
 def geocode(adresse: str) -> tuple[float, float, str] | None:
     """
     Sucht eine Adresse über swisstopo und gibt ihre Koordinaten zurück.
@@ -160,7 +165,8 @@ def live_minuten(start: str, ziel: str) -> int | None:
 
 
 def commute_minutes(ziel_lat: float, ziel_lon: float,
-                    gemeinden: pd.DataFrame, max_abfragen: int = 50) -> pd.DataFrame:
+                    gemeinden: pd.DataFrame, max_abfragen: int = 50,
+                    fortschritt=None) -> pd.DataFrame:
     """
     Liefert die Pendelzeit mit dem ÖV von jeder Gemeinde zum Arbeitsort.
 
@@ -172,6 +178,8 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
         ziel_lat, ziel_lon: Koordinaten des Arbeitsorts
         gemeinden:          DataFrame mit bfs_nr, name, lat, lon
         max_abfragen:       maximale Anzahl Live-Abfragen
+        fortschritt:        optional ein Fortschrittsbalken aus app.py (st.progress),
+                            der während der Live-Abfragen nachgeführt wird
 
     Rückgabe: DataFrame mit bfs_nr, pendel_min, pendel_geschaetzt
     """
@@ -196,7 +204,25 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
     naechste = resultat.sort_values("km").head(max_abfragen)
 
     con = get_connection()
+    # Gleiche Tabelle wie in scripts/build_db.py. Hier nochmals "falls nicht vorhanden",
+    # damit die App nicht abstürzt, wenn die Datenbank (z. B. online) noch fehlt.
+    with con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pendel_cache (
+                bfs_nr INTEGER,
+                ziel TEXT,
+                minuten REAL,
+                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bfs_nr, ziel)
+            )""")
+    fehler_in_folge = 0
+    erledigt = 0
     for index, zeile in naechste.iterrows():
+        # Notbremse: Antwortet die API dreimal hintereinander nicht, ist sie wohl
+        # gestört. Dann nicht weiter warten, die restlichen Gemeinden bleiben geschätzt.
+        if fehler_in_folge >= 3:
+            break
+
         bfs_nr = int(zeile["bfs_nr"])
 
         # 3a: Zuerst im Cache nachsehen, ob wir diese Verbindung schon kennen
@@ -212,6 +238,10 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
             gemeinde = gemeinden.loc[index]
             start = f"{gemeinde['lat']:.4f},{gemeinde['lon']:.4f}"
             minuten = live_minuten(start, ziel)
+            if minuten is None:
+                fehler_in_folge += 1
+            else:
+                fehler_in_folge = 0
             # Auch "keine Verbindung" speichern, nur vorübergehende Fehler (None) nicht
             if minuten is not None:
                 with con:
@@ -225,6 +255,10 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
         if minuten is not None and minuten != KEINE_VERBINDUNG:
             resultat.loc[index, "pendel_min"] = minuten
             resultat.loc[index, "pendel_geschaetzt"] = False
+
+        erledigt += 1
+        if fortschritt is not None:
+            fortschritt.progress(erledigt / len(naechste))
     con.close()
 
     return resultat[["bfs_nr", "pendel_min", "pendel_geschaetzt"]]
