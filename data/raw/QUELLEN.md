@@ -25,3 +25,15 @@ Stand der Downloads: 20.11.2026
 - Die Miet-Tabelle nach Gemeindetyp nutzt die Gemeindetypologie 2012 und fasst die 9 Typen zu 5 Gruppen zusammen. Unsere Gemeindeliste nutzt die Typologie 2020 (GDETYP2020_9). Zuordnung über die erste Ziffer des Codes (1x = städtisch, 2x = periurban, 3x = ländlich).
 - Die Gemeindegrenzen haben Stand 01.01.2025, die Gemeindeliste 01.01.2026. 14 Gemeinden haben fusioniert oder (Moutier) den Kanton gewechselt; scripts/grenzen_aufbereiten.py ordnet ihre Flächen den Gemeinden 2026 zu (Ergebnis: data/gemeindegrenzen_2026.geojson).
 - Die Mieten sind Durchschnittswerte aller bestehenden Mietverhältnisse (netto, ohne Nebenkosten), nicht aktuelle Angebotsmieten.
+
+## Kostenansätze fürs Pendeln (in data.py, keine Datei)
+
+| Wert | Quelle | Stand |
+| --- | --- | --- |
+| Strecken-Abo: Grundpreis 17.22 CHF pro km und Monat (Erwachsene, 2. Klasse), Staffelung 1–4 km 100 %, 5–14 km 40.6 %, 15–20 km 37.5 %, 21–39 km 22.7 %, 40–54 km 13.1 %, 55–250 km 11.2 %; Jahres-Abo = 9 Monatspreise | Alliance SwissPass, Tarif T650 «Tarif für Streckenabonnemente», Ziffer 4.1 | Ausgabe 01.06.2026 |
+| GA Erwachsene 2. Klasse: 4'095 CHF | Alliance SwissPass / Preisüberwacher, Medienmitteilung 04.08.2026 | ab 13.12.2026 |
+| Auto: 74 Rp. pro km total; variable Kosten 4'135 CHF bei 15'000 km pro Jahr (= 28 Rp. pro km) | TCS, Kilometerkosten 2026 | 06.01.2026 |
+| 46 Arbeitswochen pro Jahr | eigene Annahme (52 Wochen minus Ferien und Feiertage) | – |
+
+- Die Preise des Tarifs gelten pro Tarifkilometer (Bahnstrecke). Wir setzen dafür die Strassendistanz ein; die Abweichung ist für den Vergleich zwischen Gemeinden klein. Der Tarif rechnet zudem auf den letzten Kilometer einer Distanzzone; wir rechnen auf den genauen Kilometer.
+- Verbund-Abos (z. B. ZVV, Ostwind) können in Agglomerationen günstiger sein als das Strecken-Abo. Die App verwendet einheitlich das Strecken-Abo, damit alle Gemeinden gleich behandelt werden.

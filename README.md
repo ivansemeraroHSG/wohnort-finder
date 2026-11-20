@@ -51,6 +51,10 @@ Alle Daten sind öffentlich und kostenlos. Die Originaldateien liegen unverände
 | Generalisierte Gemeindegrenzen (K4) | BFS | https://statistik.admin.ch/en/asset/34367751 | 01.01.2025, angepasst auf 2026 | Karte, Koordinaten der Gemeinden |
 | Adresssuche (Arbeitsort) | swisstopo SearchServer, live | https://api3.geo.admin.ch/rest/services/api/SearchServer | laufend | Koordinaten des Arbeitsorts |
 | ÖV-Verbindungen | transport.opendata.ch, live | https://transport.opendata.ch/v1/connections | laufend | Pendelzeit zu den nächsten Gemeinden |
+| Preise Strecken-Abo (Tarif T650) | Alliance SwissPass | https://www.allianceswisspass.ch/de/tarife-vorschriften/uebersicht | Ausgabe 01.06.2026 | ÖV-Kosten pro Jahr (`data.oev_abopreis`) |
+| Preis GA 2. Klasse (4'095 CHF) | Alliance SwissPass / SBB, Medienmitteilung Preisüberwacher 04.08.2026 | https://www.sbb.ch/de/billette-angebote/abos/ga/ga-preise.html | ab Dezember 2026 | Obergrenze der ÖV-Kosten |
+| Kilometerkosten Auto (74 Rp./km, davon variabel 4'135 CHF pro 15'000 km) | TCS | https://www.tcs.ch/de/der-tcs/presse/medienmitteilungen-2026/kilometerkosten-2026.php | 2026 | Autokosten pro Jahr |
+| Fahrzeit und Strassendistanz Auto und Velo | openrouteservice (Matrix-API), live | https://openrouteservice.org | laufend | Auto- und Veloweg, Tarifkilometer (Task 2.6) |
 
 **Wie wir die Daten aufbereiten**
 
@@ -58,6 +62,7 @@ Alle Daten sind öffentlich und kostenlos. Die Originaldateien liegen unverände
 - **Mieten:** Das BFS veröffentlicht Mieten nicht pro Gemeinde. Wir schätzen sie: Kantonsmiete × (Miete des Gemeindetyps / Miete Schweiz). Alle Mieten sind darum als geschätzt markiert. Es sind Durchschnitte bestehender Mietverhältnisse (netto), nicht aktuelle Angebotsmieten.
 - **Gemeindegrenzen:** Die Grenzen haben Stand 2025. 14 Gemeinden haben bis 2026 fusioniert oder (Moutier) den Kanton gewechselt; `scripts/grenzen_aufbereiten.py` ordnet ihre Flächen den Gemeinden 2026 zu.
 - **Pendelzeit:** Für die 50 nächsten Gemeinden live abgefragt (Montag 07:30), für alle anderen aus der Luftlinie geschätzt.
+- **Pendelkosten:** ÖV = Jahres-Strecken-Abo nach Tarif T650 (Monatspreis × 9, Grundpreis 17.22 CHF pro km mit Rabatt je nach Distanz), höchstens der GA-Preis. Der Tarif rechnet mit Bahnkilometern; wir verwenden dafür die Strassendistanz. In Agglomerationen kann ein Verbund-Abo (z. B. ZVV) etwas günstiger sein. Auto = gefahrene km × 28 Rp. (Auto schon vorhanden, nur variable Kosten) bzw. 74 Rp. (TCS, inkl. Fixkosten), plus Parkplatz. 46 Arbeitswochen pro Jahr.
 
 ## Machine Learning
 
