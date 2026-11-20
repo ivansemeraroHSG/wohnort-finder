@@ -21,7 +21,7 @@ Stand der Downloads: 20.11.2026
 
 ## Bekannte Einschränkungen
 
-- Mieten gibt es vom BFS nicht pro Gemeinde, nur nach Kanton und Gemeindetyp. Die Miete pro Gemeinde wird im Mietmodell (AP 3) geschätzt.
+- Mieten gibt es vom BFS nicht pro Gemeinde, nur nach Kanton und Gemeindetyp. Die Miete pro Gemeinde schätzt scripts/build_db.py: Kantonsmiete x (Miete des Gemeindetyps / Miete Schweiz). Für 1-Zimmer-Wohnungen in Appenzell Innerrhoden fehlt der Kantonswert (BFS: "X"), dort gilt der Wert des Gemeindetyps.
 - Die Miet-Tabelle nach Gemeindetyp nutzt die Gemeindetypologie 2012 und fasst die 9 Typen zu 5 Gruppen zusammen. Unsere Gemeindeliste nutzt die Typologie 2020 (GDETYP2020_9). Zuordnung über die erste Ziffer des Codes (1x = städtisch, 2x = periurban, 3x = ländlich).
-- Die Gemeindegrenzen haben Stand 01.01.2025, die Gemeindeliste 01.01.2026. Wenige Gemeinden (Fusionen, Kantonswechsel Moutier) passen nicht exakt; wird in Task 1.3 bereinigt.
+- Die Gemeindegrenzen haben Stand 01.01.2025, die Gemeindeliste 01.01.2026. 14 Gemeinden haben fusioniert oder (Moutier) den Kanton gewechselt; scripts/grenzen_aufbereiten.py ordnet ihre Flächen den Gemeinden 2026 zu (Ergebnis: data/gemeindegrenzen_2026.geojson).
 - Die Mieten sind Durchschnittswerte aller bestehenden Mietverhältnisse (netto, ohne Nebenkosten), nicht aktuelle Angebotsmieten.

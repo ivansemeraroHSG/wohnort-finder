@@ -101,14 +101,16 @@ def steuern_laden():
 
 
 def miettabelle_laden(datei, anzahl_regionen):
-    """Mieten 2024 aus einer BFS-Tabelle, eine Zeile pro Region und Zimmerzahl."""
+    """Mieten 2024 aus einer BFS-Tabelle, eine Zeile pro Region und Zimmerzahl.
+
+    Die Zeile "Schweiz" bekommt die Nummer 0, die Regionen darunter 1, 2, 3 ...
+    """
     roh = pd.read_excel(RAW / datei, sheet_name="2024", header=None)
-    # Die Regionen stehen direkt unter der Zeile "Schweiz"
-    start = roh.index[roh[0].astype(str).str.strip() == "Schweiz"][0] + 1
-    regionen = roh.iloc[start:start + anzahl_regionen]
+    start = roh.index[roh[0].astype(str).str.strip() == "Schweiz"][0]
+    regionen = roh.iloc[start:start + anzahl_regionen + 1]
 
     zeilen = []
-    for nr, (_, region) in enumerate(regionen.iterrows(), start=1):
+    for nr, (_, region) in enumerate(regionen.iterrows()):
         for zimmer, spalte in MIET_SPALTEN.items():
             # "(1234)" = unsichere Schätzung des BFS, "X" = unterdrückt (wird zu leer)
             wert = str(region[spalte]).strip("() ")
@@ -119,6 +121,31 @@ def miettabelle_laden(datei, anzahl_regionen):
                 "miete_chf": pd.to_numeric(wert, errors="coerce"),
             })
     return pd.DataFrame(zeilen)
+
+
+def mieten_schaetzen(gemeinden, mieten_kanton, mieten_typ):
+    """Geschätzte Monatsmiete pro Gemeinde und Zimmerzahl.
+
+    Miete = Kantonsmiete x (Miete des Gemeindetyps / Miete Schweiz).
+    Beispiel: Eine ländliche Gemeinde ist schweizweit ca. 14 % günstiger als der
+    Durchschnitt, also wird die Kantonsmiete um 14 % gesenkt.
+    """
+    schweiz = mieten_kanton[mieten_kanton["kanton_id"] == 0]
+    faktor = mieten_typ.merge(schweiz, on="zimmer", suffixes=("_typ", "_ch"))
+    faktor["faktor"] = faktor["miete_chf_typ"] / faktor["miete_chf_ch"]
+
+    mieten = (
+        gemeinden[["bfs_nr", "kanton_id", "typ_gruppe"]]
+        .merge(mieten_kanton[["kanton_id", "zimmer", "miete_chf"]], on="kanton_id")
+        .merge(faktor[["typ_gruppe", "zimmer", "faktor", "miete_chf_typ"]],
+               on=["typ_gruppe", "zimmer"])
+    )
+    # Fehlt der Kantonswert (vom BFS unterdrückt), gilt der Wert des Gemeindetyps
+    mieten["miete_chf"] = (mieten["miete_chf"] * mieten["faktor"]).fillna(mieten["miete_chf_typ"])
+    mieten["miete_chf"] = mieten["miete_chf"].round()
+    # Das BFS hat keine Mieten pro Gemeinde, darum ist jeder Wert eine Schätzung
+    mieten["miete_geschaetzt"] = True
+    return mieten[["bfs_nr", "zimmer", "miete_chf", "miete_geschaetzt"]]
 
 
 def leere_tabellen_anlegen(con):
@@ -151,6 +178,8 @@ def main():
     mieten_kanton = mieten_kanton.rename(columns={"nr": "kanton_id"})
     mieten_typ = miettabelle_laden("mieten_pro_gemeindetyp.xlsx", len(TYP_GRUPPEN))
     mieten_typ = mieten_typ.rename(columns={"nr": "typ_gruppe"})
+    mieten_typ = mieten_typ[mieten_typ["typ_gruppe"] > 0]  # Schweiz steht schon in mieten_kanton
+    mieten = mieten_schaetzen(gemeinden, mieten_kanton, mieten_typ)
 
     DB.unlink(missing_ok=True)  # immer frisch aufbauen
     with sqlite3.connect(DB) as con:
@@ -158,6 +187,7 @@ def main():
         steuern.to_sql("steuern", con, index=False)
         mieten_kanton.to_sql("mieten_kanton", con, index=False)
         mieten_typ.to_sql("mieten_typ", con, index=False)
+        mieten.to_sql("mieten", con, index=False)
         leere_tabellen_anlegen(con)
 
     # Kurze Kontrolle, ob alles zusammenpasst
@@ -165,8 +195,9 @@ def main():
     print(f"Gemeinden: {len(gemeinden)}, davon ohne Gruppe: {gemeinden['typ_gruppe'].isna().sum()}, "
           f"ohne Koordinaten: {gemeinden['lat'].isna().sum()}")
     print(f"Steuerzeilen: {len(steuern)}, Gemeinden ohne Steuerdaten: {len(ohne_steuern)}")
-    print(f"Mieten Kanton: {mieten_kanton['miete_chf'].notna().sum()} Werte, "
+    print(f"Mieten Kanton: {mieten_kanton['miete_chf'].notna().sum()} Werte (inkl. Schweiz), "
           f"Mieten Gemeindetyp: {mieten_typ['miete_chf'].notna().sum()} Werte")
+    print(f"Geschätzte Mieten: {len(mieten)} Zeilen, davon leer: {mieten['miete_chf'].isna().sum()}")
     print(f"Gemeindetypen in der Liste: {sorted(int(t) for t in gemeinden['gemeindetyp'].dropna().unique())}")
     print(f"Fertig: {DB}")
 

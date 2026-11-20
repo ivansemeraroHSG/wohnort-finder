@@ -73,11 +73,10 @@ def get_tax(einkommen: int, haushalt: str) -> pd.DataFrame:
 
 def get_rent(zimmer: int) -> pd.DataFrame:
     """
-    Liefert die durchschnittliche Monatsmiete pro Gemeinde für eine Zimmerzahl.
+    Liefert die geschätzte Monatsmiete pro Gemeinde für eine Zimmerzahl.
 
-    Das BFS publiziert Mieten nur pro Kanton und pro Gemeindetyp, nicht pro Gemeinde.
-    Vorläufig gilt darum der Kantonswert; fehlt er, der Wert des Gemeindetyps
-    (miete_geschaetzt = True). Das genauere Mietmodell folgt in einem späteren Task.
+    Das BFS publiziert Mieten nur pro Kanton und pro Gemeindetyp. Die Werte pro
+    Gemeinde schätzt scripts/build_db.py aus beiden (Tabelle "mieten").
 
     Parameter:
         zimmer: Anzahl Zimmer, 1 bis 6 (6 = "6 und mehr")
@@ -87,18 +86,12 @@ def get_rent(zimmer: int) -> pd.DataFrame:
     zimmer = min(max(int(zimmer), 1), 6)
     with get_connection() as con:
         mieten = pd.read_sql(
-            """
-            SELECT g.bfs_nr, k.miete_chf AS miete_kanton, t.miete_chf AS miete_typ
-            FROM gemeinden g
-            LEFT JOIN mieten_kanton k ON k.kanton_id = g.kanton_id AND k.zimmer = ?
-            LEFT JOIN mieten_typ t ON t.typ_gruppe = g.typ_gruppe AND t.zimmer = ?
-            """,
+            "SELECT bfs_nr, miete_chf, miete_geschaetzt FROM mieten WHERE zimmer = ?",
             con,
-            params=(zimmer, zimmer),
+            params=(zimmer,),
         )
-    mieten["miete_geschaetzt"] = mieten["miete_kanton"].isna()
-    mieten["miete_chf"] = mieten["miete_kanton"].fillna(mieten["miete_typ"])
-    return mieten[["bfs_nr", "miete_chf", "miete_geschaetzt"]]
+    mieten["miete_geschaetzt"] = mieten["miete_geschaetzt"].astype(bool)
+    return mieten
 
 
 def save_rating(bfs_nr: int, gefaellt: bool, sitzung: str) -> None:
