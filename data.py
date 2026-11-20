@@ -42,19 +42,20 @@ MONATE_PRO_JAHRESABO = 9
 # Wer schon ein Auto hat, zahlt fürs Pendeln nur die variablen Kosten.
 AUTO_CHF_PRO_KM_VARIABEL = 0.28
 AUTO_CHF_PRO_KM_TOTAL = 0.74
+# Abo-Arten, die die Nutzerin wählen kann (Schlüssel für oev_abopreis)
+OEV_ABOS = {
+    "guenstigstes": "Günstigstes automatisch (Strecken-Abo oder GA)",
+    "jahr": "Jahres-Strecken-Abo",
+    "monat": "Monats-Strecken-Abo (monatlich kündbar)",
+    "ga": "GA neu kaufen",
+    "ga_vorhanden": "GA habe ich schon (kostet nichts zusätzlich)",
+}
 # Arbeitswochen pro Jahr (52 Wochen minus Ferien und Feiertage)
 ARBEITSWOCHEN = 46
 
 
-def oev_abopreis(km: float) -> float:
-    """
-    Preis eines Jahres-Strecken-Abos (Erwachsene, 2. Klasse) in CHF nach Tarif T650.
-
-    Parameter:
-        km: Tarifkilometer der Strecke (ungefähr die Strassendistanz, nicht die Luftlinie)
-
-    Rückgabe: Jahrespreis in CHF, höchstens der Preis des GA
-    """
+def oev_monatspreis(km: float) -> float:
+    """Preis eines Monats-Strecken-Abos (Erwachsene, 2. Klasse) in CHF nach Tarif T650."""
     km = max(4, math.ceil(km))   # Mindestpreis ist der Preis für 4 km
     monatspreis = 0.0
     bisher = 0
@@ -64,8 +65,29 @@ def oev_abopreis(km: float) -> float:
             break
         monatspreis += km_in_stufe * STRECKENABO_CHF_PRO_KM * anteil
         bisher = bis_km
-    # Der Tarif rundet auf den nächsten Franken auf
-    return min(math.ceil(monatspreis) * MONATE_PRO_JAHRESABO, GA_PREIS)
+    return math.ceil(monatspreis)   # der Tarif rundet auf den nächsten Franken auf
+
+
+def oev_abopreis(km: float, abo: str = "guenstigstes") -> float:
+    """
+    ÖV-Kosten pro Jahr in CHF für eine Strecke, je nach Abo.
+
+    Parameter:
+        km:  Tarifkilometer der Strecke (ungefähr die Strassendistanz, nicht die Luftlinie)
+        abo: "guenstigstes" (Jahres-Strecken-Abo oder GA, was günstiger ist),
+             "jahr" (Jahres-Strecken-Abo), "monat" (12 Monats-Strecken-Abos, monatlich kündbar),
+             "ga" (GA neu kaufen) oder "ga_vorhanden" (GA schon bezahlt, kostet nichts zusätzlich)
+    """
+    if abo == "ga_vorhanden":
+        return 0
+    if abo == "ga":
+        return GA_PREIS
+    if abo == "monat":
+        return 12 * oev_monatspreis(km)
+    jahresabo = oev_monatspreis(km) * MONATE_PRO_JAHRESABO   # 9 Monate zahlen, 12 fahren
+    if abo == "jahr":
+        return jahresabo
+    return min(jahresabo, GA_PREIS)
 
 
 def get_connection() -> sqlite3.Connection:

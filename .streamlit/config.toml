@@ -1,0 +1,16 @@
+# Aussehen der App: warmes, ruhiges Papier-Design statt Streamlit-Standard
+[theme]
+base = "light"
+primaryColor = "#2f6b4f"            # Waldgrün für Hauptknöpfe und Regler
+backgroundColor = "#f7f4ee"         # Alabaster / Papier
+secondaryBackgroundColor = "#ece7dc"
+textColor = "#22211e"               # Tinte
+borderColor = "#d9d2c3"
+linkColor = "#2f6aa3"
+baseRadius = "0.25rem"
+font = "IBM Plex Sans:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+headingFont = "Source Serif 4:https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap"
+codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap"
+
+[browser]
+gatherUsageStats = false
