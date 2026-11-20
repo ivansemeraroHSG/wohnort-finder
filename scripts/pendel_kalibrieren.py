@@ -5,6 +5,8 @@ Fragt ein paar echte ÖV-Verbindungen ab, berechnet für jede die Luftlinie
 und legt mit einer linearen Regression eine Gerade durch die Punkte:
     Minuten = a + b * km
 Die Werte a und b werden danach in api.py bei PENDEL_A und PENDEL_B eingetragen.
+Weil es Bahnhof-zu-Bahnhof-Verbindungen sind, ist die Formel eine Untergrenze; das ist
+gewollt, siehe Kommentar in api.py und scripts/schaetzung_pruefen.py.
 
 Muss nur einmal laufen. Ausführen (im Projektordner, Umgebung aktiv):
     python scripts/pendel_kalibrieren.py
