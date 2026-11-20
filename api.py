@@ -20,7 +20,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from data import get_cache_connection
+from data import (ARBEITSWOCHEN, AUTO_CHF_PRO_KM_TOTAL, AUTO_CHF_PRO_KM_VARIABEL,
+                  get_cache_connection, oev_abopreis)
 
 SWISSTOPO_URL = "https://api3.geo.admin.ch/rest/services/api/SearchServer"
 TRANSPORT_URL = "https://transport.opendata.ch/v1/connections"
@@ -51,6 +52,9 @@ VELO_MAX_KM = 25   # Velo wird nur bis 45 Min. angeboten, weiter weg nicht abfra
 # 2'084 Auto- und 212 Velorouten), siehe Test unten.
 UMWEG = {PROFIL_AUTO: 1.35, PROFIL_VELO: 1.35}  # Strassen-km pro km Luftlinie
 TEMPO_KMH = {PROFIL_AUTO: 76, PROFIL_VELO: 18}  # Durchschnitt auf der Strasse
+
+# Pendelkosten (Task 2.7)
+VELO_MAX_MIN = 45   # länger fährt kaum jemand täglich Velo, darum nur bis hier anbieten
 
 
 # Streamlit führt app.py bei jedem Klick neu aus. Ohne Cache würde dieselbe
@@ -379,6 +383,104 @@ def route_matrix(ziel_lat: float, ziel_lon: float,
     return resultat.reset_index()
 
 
+def bestes_verkehrsmittel(optionen: dict, max_min: float, zeitwert: float | None) -> str | None:
+    """
+    Wählt aus {"oev": (minuten, chf), ...} das beste Verkehrsmittel.
+
+    Ohne Zeitwert gewinnt das günstigste, mit Zeitwert das mit den tiefsten
+    Kosten + Zeitwert × Minuten. Nur Verkehrsmittel bis max_min zählen.
+    """
+    bestes = None
+    beste_punkte = None
+    for vm in optionen:
+        minuten, chf = optionen[vm]
+        if minuten > max_min:
+            continue
+        if zeitwert is None:
+            punkte = chf
+        else:
+            punkte = chf + zeitwert * minuten
+        if beste_punkte is None or punkte < beste_punkte:
+            bestes = vm
+            beste_punkte = punkte
+
+    # Keins ist schnell genug: das schnellste nehmen. Die App filtert solche
+    # Gemeinden über die maximale Pendelzeit sowieso heraus.
+    if bestes is None:
+        for vm in optionen:
+            if bestes is None or optionen[vm][0] < optionen[bestes][0]:
+                bestes = vm
+    return bestes
+
+
+# Mit Claude erstellt, angepasst von Gregor Weber
+def pendel_optionen(gemeinden: pd.DataFrame, pendel: pd.DataFrame,
+                    routen: pd.DataFrame, eingaben: dict) -> pd.DataFrame:
+    """
+    Zeit und Kosten pro Jahr für ÖV, Auto und Velo sowie das beste Verkehrsmittel.
+
+    Parameter:
+        gemeinden: DataFrame mit bfs_nr
+        pendel:    Ergebnis von commute_minutes() (ÖV)
+        routen:    Ergebnisse von route_matrix() für Auto und Velo, verknüpft über bfs_nr
+        eingaben:  {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5,
+                    "hat_auto": False, "parkplatz_chf": 0, "hat_ga": False,
+                    "max_pendel_min": 45, "zeitwert": None}
+                   zeitwert = CHF pro Jahr für 1 Minute pro Weg (von AP 3), None = noch keiner
+
+    Rückgabe: DataFrame mit bfs_nr, oev_min, oev_chf, oev_geschaetzt, auto_min, auto_chf,
+              velo_min, velo_chf, bestes_vm, pendel_min, pendel_chf
+              (nicht gewählte Verkehrsmittel bleiben leer)
+    """
+    df = gemeinden[["bfs_nr"]].merge(pendel, on="bfs_nr").merge(routen, on="bfs_nr")
+    df = df.rename(columns={"pendel_min": "oev_min", "pendel_geschaetzt": "oev_geschaetzt"})
+
+    gewaehlt = eingaben["verkehrsmittel"]
+    if eingaben["hat_auto"]:
+        auto_chf_pro_km = AUTO_CHF_PRO_KM_VARIABEL
+    else:
+        auto_chf_pro_km = AUTO_CHF_PRO_KM_TOTAL
+    fahrten_pro_jahr = 2 * eingaben["buerotage"] * ARBEITSWOCHEN   # hin und zurück
+
+    zeilen = []
+    for index, g in df.iterrows():
+        zeile = {"bfs_nr": g["bfs_nr"], "oev_geschaetzt": g["oev_geschaetzt"]}
+        optionen = {}
+
+        if "oev" in gewaehlt:
+            # Tarif-km des Abos: Strassen-km als Näherung, die Bahn ist ähnlich lang
+            if eingaben["hat_ga"]:
+                oev_chf = 0
+            else:
+                oev_chf = oev_abopreis(g["auto_km"])
+            optionen["oev"] = (g["oev_min"], oev_chf)
+        if "auto" in gewaehlt:
+            auto_chf = g["auto_km"] * fahrten_pro_jahr * auto_chf_pro_km + 12 * eingaben["parkplatz_chf"]
+            optionen["auto"] = (g["auto_min"], round(auto_chf))
+        if "velo" in gewaehlt and g["velo_min"] <= VELO_MAX_MIN:
+            optionen["velo"] = (g["velo_min"], 0)
+
+        for vm in ["oev", "auto", "velo"]:
+            if vm in optionen:
+                zeile[f"{vm}_min"] = optionen[vm][0]
+                zeile[f"{vm}_chf"] = optionen[vm][1]
+            else:
+                zeile[f"{vm}_min"] = None
+                zeile[f"{vm}_chf"] = None
+
+        bestes = bestes_verkehrsmittel(optionen, eingaben["max_pendel_min"], eingaben["zeitwert"])
+        zeile["bestes_vm"] = bestes
+        if bestes is None:   # gar kein Verkehrsmittel gewählt
+            zeile["pendel_min"] = None
+            zeile["pendel_chf"] = None
+        else:
+            zeile["pendel_min"] = optionen[bestes][0]
+            zeile["pendel_chf"] = optionen[bestes][1]
+        zeilen.append(zeile)
+
+    return pd.DataFrame(zeilen)
+
+
 # --- Test: läuft nur bei "python api.py", nicht wenn app.py die Datei importiert ---
 if __name__ == "__main__":
     test_adressen = [
@@ -446,3 +548,29 @@ if __name__ == "__main__":
         tempo = (echt[f"{vm}_km"] / echt[f"{vm}_min"] * 60).median()
         print(f"{vm}: Umweg {umweg:.2f}, Tempo {tempo:.0f} km/h -> in UMWEG und TEMPO_KMH eintragen")
         print(echt.sort_values(f"{vm}_min")[["name", f"{vm}_min", f"{vm}_km"]].head(5))
+
+    # --- Pendelkosten (Task 2.7): drei Testfälle Rapperswil-Jona -> Zürich HB ---
+    print()
+    print("Pendelkosten Rapperswil-Jona -> Zürich HB (bitte von Hand nachrechnen):")
+    pendel = commute_minutes(47.378, 8.540, alle)
+    routen = route_matrix(47.378, 8.540, alle, PROFIL_AUTO).merge(
+        route_matrix(47.378, 8.540, alle, PROFIL_VELO), on="bfs_nr")
+    rj = alle[alle["name"] == "Rapperswil-Jona"]["bfs_nr"].iloc[0]
+    eingaben = {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5, "hat_auto": False,
+                "parkplatz_chf": 0, "hat_ga": False, "max_pendel_min": 60, "zeitwert": None}
+    testfaelle = [
+        ("1) kein Auto, Parkplatz 0", {}),
+        ("2) hat schon ein Auto, Parkplatz 0", {"hat_auto": True}),
+        ("3) hat schon ein Auto, Parkplatz 200 CHF/Monat", {"hat_auto": True, "parkplatz_chf": 200}),
+    ]
+    for titel, aenderung in testfaelle:
+        e = eingaben.copy()   # copy: die Grundeingaben sollen für den nächsten Fall gleich bleiben
+        e.update(aenderung)
+        df = pendel_optionen(alle, pendel, routen, e)
+        print(titel)
+        print(df[df["bfs_nr"] == rj].drop(columns="bfs_nr").to_string(index=False))
+    print("Strassen-km:", routen[routen["bfs_nr"] == rj]["auto_km"].iloc[0],
+          " ÖV-Abo laut oev_abopreis():", oev_abopreis(routen[routen["bfs_nr"] == rj]["auto_km"].iloc[0]))
+    df = pendel_optionen(alle, pendel, routen, eingaben)
+    print("Bestes Verkehrsmittel über alle Gemeinden (Fall 1):")
+    print(df["bestes_vm"].value_counts().to_string())
