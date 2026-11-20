@@ -27,6 +27,8 @@ HAUSHALT_TEXT = {
 }
 STANDARD_WOHNORT = "Zürich"
 ANZAHL_TOP = 10
+ANZAHL_LIVE_KANDIDATEN = 30   # pro Runde so viele geschätzte Gemeinden live nachfragen
+MAX_RUNDEN = 3                # danach aufhören, damit die App nicht zu lange lädt
 
 
 def chf(betrag):
@@ -86,6 +88,29 @@ else:
         st.session_state["pendel"] = commute_minutes(ziel_lat, ziel_lon, gemeinden, fortschritt=balken)
         st.session_state["pendel_arbeitsort"] = ort_name
         balken.empty()   # Balken ausblenden, wenn fertig
+
+    # Task 2.8 (mit Claude erstellt, angepasst von Gregor Weber): Geschätzte Zeiten
+    # können zu optimistisch sein, und dann rutscht eine schlecht erschlossene
+    # Gemeinde nach oben. Darum die günstigsten Kandidaten, die noch geschätzt sind,
+    # live nachfragen. Ändert sich dadurch die Rangliste, eine weitere Runde.
+    for runde in range(MAX_RUNDEN):
+        pendel = st.session_state["pendel"]
+        mit_pendel = df.merge(pendel, on="bfs_nr")
+        moeglich = mit_pendel[(mit_pendel["bfs_nr"] != heute_nr) & (mit_pendel["pendel_min"] <= max_pendel)]
+        moeglich = moeglich.sort_values("wohnkosten")
+        # Fertig, sobald die angezeigten Top 10 nur echte Zeiten haben
+        if (moeglich.head(ANZAHL_TOP)["pendel_geschaetzt"] == False).all():
+            break
+        # Sonst die günstigsten, die noch geschätzt sind, egal auf welchem Platz
+        geschaetzt = moeglich[moeglich["pendel_geschaetzt"] == True]
+        offen = geschaetzt.head(ANZAHL_LIVE_KANDIDATEN)["bfs_nr"].tolist()
+        balken = st.progress(0.0, text="Echte ÖV-Zeiten für die günstigsten Gemeinden …")
+        neu = commute_minutes(ziel_lat, ziel_lon, gemeinden, fortschritt=balken, zusaetzlich=offen)
+        balken.empty()
+        # Keine einzige neue echte Zeit (z. B. API gestört): nicht weiter versuchen
+        if neu["pendel_geschaetzt"].sum() == pendel["pendel_geschaetzt"].sum():
+            break
+        st.session_state["pendel"] = neu
     df = df.merge(st.session_state["pendel"], on="bfs_nr")
 
 # --- Vergleich mit dem heutigen Wohnort ---
@@ -132,9 +157,12 @@ else:
     # Ganze Franken und Minuten reichen, Nachkommastellen lenken nur ab
     anzeige = anzeige.astype({s: "Int64" for s in anzeige.columns if s not in ("name", "kanton")})
     st.dataframe(anzeige.rename(columns=spalten), hide_index=True)
+    if "pendel_geschaetzt" in top.columns:
+        echt = (top["pendel_geschaetzt"] == False).sum()
+        st.caption(f"ÖV-Zeiten in dieser Rangliste: {echt} echt, {len(top) - echt} geschätzt")
 
 st.caption(
     "Steuern: ESTV, Steuerjahr 2026, Einkommenssteuer ohne Kirchensteuer. "
     "Mieten: Schätzung aus BFS-Durchschnitten pro Kanton und Gemeindetyp (bestehende Mietverhältnisse). "
-    "Pendelzeiten mit dem ÖV: für die nächsten Gemeinden echte Verbindungen, sonst geschätzt."
+    "Pendelzeiten mit dem ÖV: für die nächsten und die günstigsten Gemeinden echte Verbindungen, sonst geschätzt."
 )
