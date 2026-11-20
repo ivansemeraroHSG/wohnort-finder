@@ -149,7 +149,7 @@ def mieten_schaetzen(gemeinden, mieten_kanton, mieten_typ):
 
 
 def leere_tabellen_anlegen(con):
-    """Tabellen, die erst die App beim Benutzen füllt."""
+    """Tabellen, die erst die App beim Benutzen füllt (der Cache liegt in data/cache.db)."""
     con.execute("""
         CREATE TABLE bewertungen (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,14 +157,6 @@ def leere_tabellen_anlegen(con):
             bfs_nr INTEGER,
             gefaellt INTEGER,
             zeitpunkt TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-    con.execute("""
-        CREATE TABLE pendel_cache (
-            bfs_nr INTEGER,
-            ziel TEXT,
-            minuten REAL,
-            abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (bfs_nr, ziel)
         )""")
 
 

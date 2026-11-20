@@ -20,6 +20,9 @@ import pandas as pd
 
 # Pfad zur Datenbank (wird von scripts/build_db.py erzeugt)
 DB_PATH = Path(__file__).parent / "data" / "wohnort.db"
+# Zwischenspeicher für API-Antworten. Eigene Datei, die nicht auf GitHub kommt
+# (.gitignore), damit sich wohnort.db beim Benutzen der App nicht ändert.
+CACHE_PATH = Path(__file__).parent / "data" / "cache.db"
 
 HAUSHALTE = ["ledig", "verheiratet", "verheiratet_2_kinder"]
 
@@ -27,6 +30,33 @@ HAUSHALTE = ["ledig", "verheiratet", "verheiratet_2_kinder"]
 def get_connection() -> sqlite3.Connection:
     """Öffnet eine Verbindung zur SQLite-Datenbank und gibt sie zurück."""
     return sqlite3.connect(DB_PATH)
+
+
+def get_cache_connection() -> sqlite3.Connection:
+    """Öffnet den Cache für API-Antworten und legt Datei und Tabellen bei Bedarf an."""
+    con = sqlite3.connect(CACHE_PATH)
+    with con:
+        # ÖV-Fahrzeit pro Gemeinde und Arbeitsort (transport.opendata.ch)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pendel_cache (
+                bfs_nr INTEGER,
+                ziel TEXT,
+                minuten REAL,
+                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bfs_nr, ziel)
+            )""")
+        # Auto und Velo pro Gemeinde und Arbeitsort (openrouteservice, Task 2.6)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS route_cache (
+                bfs_nr INTEGER,
+                ziel TEXT,
+                profil TEXT,
+                minuten REAL,
+                km REAL,
+                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bfs_nr, ziel, profil)
+            )""")
+    return con
 
 
 def get_municipalities() -> pd.DataFrame:

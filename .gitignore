@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 .streamlit/secrets.toml
+
+# Cache der API-Antworten (entsteht beim Benutzen der App)
+data/cache.db
