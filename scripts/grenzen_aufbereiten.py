@@ -1,4 +1,6 @@
 """Passt die BFS-Gemeindegrenzen (Stand 1.1.2025) an die Gemeindeliste 2026 an."""
+# Mit Claude erstellt, angepasst von Ivan
+#
 # Ausführen im Projektordner:  python scripts/grenzen_aufbereiten.py
 # Ergebnis: data/gemeindegrenzen_2026.geojson (wird von der Karte in der App gelesen)
 
