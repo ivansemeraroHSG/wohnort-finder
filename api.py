@@ -3,9 +3,11 @@ api.py – Arbeitsort finden und Pendelzeiten abfragen (Arbeitspaket 2).
 
 Verantwortlich: Gregor Weber
 
-Genutzte APIs (beide ohne Schlüssel, kostenlos):
+Genutzte APIs (alle kostenlos):
 - swisstopo SearchServer: https://api3.geo.admin.ch/rest/services/api/SearchServer
 - transport.opendata.ch:  https://transport.opendata.ch/v1/connections
+- openrouteservice Matrix: https://api.openrouteservice.org/v2/matrix
+  (braucht einen Schlüssel: lokal in .streamlit/secrets.toml, online in Streamlit Cloud)
 """
 
 from __future__ import annotations
@@ -35,6 +37,20 @@ PENDEL_B = 0.76
 # Verbindung gefunden hat (z. B. Ort ohne ÖV). Wird im Cache gespeichert,
 # damit wir nicht jedes Mal erneut vergeblich fragen.
 KEINE_VERBINDUNG = -1
+
+# openrouteservice: Auto und Velo (Task 2.6)
+ORS_URL = "https://api.openrouteservice.org/v2/matrix/"
+PROFIL_AUTO = "driving-car"
+PROFIL_VELO = "cycling-regular"
+VERKEHRSMITTEL = {PROFIL_AUTO: "auto", PROFIL_VELO: "velo"}   # Präfix der Spaltennamen
+ORS_TIMEOUT = 30   # eine Matrix für alle 2'110 Gemeinden braucht einige Sekunden
+VELO_MAX_KM = 25   # Velo wird nur bis 45 Min. angeboten, weiter weg nicht abfragen
+
+# Schätzung, wenn openrouteservice nicht antwortet: Luftlinie -> Strasse.
+# Median aus echten Antworten vom 20.11.2026 (Arbeitsort Zürich HB,
+# 2'084 Auto- und 212 Velorouten), siehe Test unten.
+UMWEG = {PROFIL_AUTO: 1.35, PROFIL_VELO: 1.35}  # Strassen-km pro km Luftlinie
+TEMPO_KMH = {PROFIL_AUTO: 76, PROFIL_VELO: 18}  # Durchschnitt auf der Strasse
 
 
 # Streamlit führt app.py bei jedem Klick neu aus. Ohne Cache würde dieselbe
@@ -254,6 +270,115 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
     return resultat[["bfs_nr", "pendel_min", "pendel_geschaetzt"]]
 
 
+def ors_schluessel() -> str | None:
+    """API-Schlüssel für openrouteservice aus den Streamlit-Secrets, sonst None."""
+    try:
+        return st.secrets["ORS_KEY"]
+    except (KeyError, FileNotFoundError):   # secrets.toml oder Eintrag fehlt
+        return None
+
+
+# Mit Claude erstellt, angepasst von Gregor Weber
+def ors_abfrage(ziel_lat: float, ziel_lon: float,
+                kandidaten: pd.DataFrame, profil: str) -> pd.DataFrame | None:
+    """
+    Eine Matrix-Anfrage an openrouteservice: alle Kandidaten -> Arbeitsort.
+
+    Rückgabe: DataFrame mit bfs_nr, minuten, km oder None bei einem Fehler
+    """
+    schluessel = ors_schluessel()
+    if schluessel is None:
+        return None
+
+    # openrouteservice will [lon, lat], also umgekehrt als swisstopo.
+    # Ort 0 ist der Arbeitsort, danach kommen die Gemeinden.
+    orte = [[ziel_lon, ziel_lat]]
+    for index, zeile in kandidaten.iterrows():
+        orte.append([zeile["lon"], zeile["lat"]])
+
+    anfrage = {
+        "locations": orte,
+        "sources": list(range(1, len(orte))),   # alle Gemeinden
+        "destinations": [0],                     # nur der Arbeitsort
+        "metrics": ["duration", "distance"],
+        "units": "km",
+    }
+    try:
+        r = requests.post(ORS_URL + profil, json=anfrage,
+                          headers={"Authorization": schluessel}, timeout=ORS_TIMEOUT)
+    except requests.exceptions.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+
+    # Pro Gemeinde eine Liste mit genau einem Wert, weil es nur ein Ziel gibt
+    daten = r.json()
+    zeilen = []
+    for bfs_nr, dauer, distanz in zip(kandidaten["bfs_nr"], daten["durations"], daten["distances"]):
+        if dauer[0] is None:   # keine Route gefunden, z. B. autofreie Gemeinde
+            continue
+        zeilen.append({"bfs_nr": int(bfs_nr), "minuten": dauer[0] / 60, "km": distanz[0]})
+    if len(zeilen) == 0:
+        return None
+    return pd.DataFrame(zeilen)
+
+
+def route_matrix(ziel_lat: float, ziel_lon: float,
+                 gemeinden: pd.DataFrame, profil: str) -> pd.DataFrame:
+    """
+    Fahrzeit und Strassen-km mit Auto oder Velo von jeder Gemeinde zum Arbeitsort.
+
+    Parameter:
+        gemeinden: DataFrame mit bfs_nr, lat, lon
+        profil:    PROFIL_AUTO oder PROFIL_VELO
+
+    Rückgabe: DataFrame mit bfs_nr, <vm>_min, <vm>_km, <vm>_geschaetzt
+              (<vm> = auto oder velo)
+    """
+    vm = VERKEHRSMITTEL[profil]
+    ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
+
+    # Schritt 1: für alle Gemeinden eine Schätzung aus der Luftlinie
+    kandidaten = gemeinden[["bfs_nr", "lat", "lon"]].copy()   # copy: wir fügen eine Spalte an
+    km_liste = []
+    for index, zeile in kandidaten.iterrows():
+        km_liste.append(haversine_km(ziel_lat, ziel_lon, zeile["lat"], zeile["lon"]))
+    kandidaten["luftlinie"] = km_liste
+
+    resultat = pd.DataFrame()
+    resultat["bfs_nr"] = kandidaten["bfs_nr"]
+    resultat[f"{vm}_km"] = (kandidaten["luftlinie"] * UMWEG[profil]).round(1)
+    resultat[f"{vm}_min"] = (resultat[f"{vm}_km"] / TEMPO_KMH[profil] * 60).round(0)
+    resultat[f"{vm}_geschaetzt"] = True
+    resultat = resultat.set_index("bfs_nr")
+
+    # Schritt 2: echte Werte zuerst im Cache suchen, sonst bei openrouteservice holen
+    con = get_cache_connection()
+    echte = pd.read_sql("SELECT bfs_nr, minuten, km FROM route_cache WHERE ziel = ? AND profil = ?",
+                        con, params=(ziel, profil))
+    if len(echte) == 0:
+        if profil == PROFIL_VELO:
+            kandidaten = kandidaten[kandidaten["luftlinie"] <= VELO_MAX_KM]
+        echte = ors_abfrage(ziel_lat, ziel_lon, kandidaten, profil)
+        if echte is not None:
+            speichern = echte.copy()   # copy: ziel und profil nur für den Cache
+            speichern["ziel"] = ziel
+            speichern["profil"] = profil
+            with con:
+                speichern.to_sql("route_cache", con, if_exists="append", index=False)
+    con.close()
+
+    # Schritt 3: Schätzungen durch die echten Werte ersetzen
+    if echte is not None:
+        for index, zeile in echte.iterrows():
+            bfs_nr = int(zeile["bfs_nr"])
+            resultat.loc[bfs_nr, f"{vm}_min"] = round(zeile["minuten"])
+            resultat.loc[bfs_nr, f"{vm}_km"] = round(zeile["km"], 1)
+            resultat.loc[bfs_nr, f"{vm}_geschaetzt"] = False
+
+    return resultat.reset_index()
+
+
 # --- Test: läuft nur bei "python api.py", nicht wenn app.py die Datei importiert ---
 if __name__ == "__main__":
     test_adressen = [
@@ -297,3 +422,27 @@ if __name__ == "__main__":
     with con:
         con.execute("DELETE FROM pendel_cache WHERE ziel = ?", ("47.3780,8.5400",))
     con.close()
+
+    # --- Auto und Velo mit openrouteservice, echte Gemeinden, Arbeitsort Zürich HB ---
+    from data import get_municipalities
+    alle = get_municipalities()
+    print()
+    print("openrouteservice-Schlüssel gefunden:", ors_schluessel() is not None)
+    for profil in [PROFIL_AUTO, PROFIL_VELO]:
+        vm = VERKEHRSMITTEL[profil]
+        startzeit = time.time()
+        routen = route_matrix(47.378, 8.540, alle, profil)
+        print(f"{vm} 1. Aufruf: {time.time() - startzeit:.1f} Sekunden")
+        startzeit = time.time()
+        routen = route_matrix(47.378, 8.540, alle, profil)
+        print(f"{vm} 2. Aufruf: {time.time() - startzeit:.1f} Sekunden")
+        echt = routen[routen[f"{vm}_geschaetzt"] == False]
+        print(f"{vm}: {len(echt)} echte Werte, {len(routen) - len(echt)} geschätzt")
+
+        # Werte für die Schätzung bestimmen: Umweg und Tempo im Durchschnitt
+        echt = echt.merge(alle[["bfs_nr", "name", "lat", "lon"]], on="bfs_nr")
+        luftlinie = [haversine_km(47.378, 8.540, lat, lon) for lat, lon in zip(echt["lat"], echt["lon"])]
+        umweg = (echt[f"{vm}_km"] / pd.Series(luftlinie)).median()
+        tempo = (echt[f"{vm}_km"] / echt[f"{vm}_min"] * 60).median()
+        print(f"{vm}: Umweg {umweg:.2f}, Tempo {tempo:.0f} km/h -> in UMWEG und TEMPO_KMH eintragen")
+        print(echt.sort_values(f"{vm}_min")[["name", f"{vm}_min", f"{vm}_km"]].head(5))
