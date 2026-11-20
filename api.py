@@ -39,6 +39,12 @@ PENDEL_B = 0.76
 # damit wir nicht jedes Mal erneut vergeblich fragen.
 KEINE_VERBINDUNG = -1
 
+# Sucht man eine Gemeinde mit dem Namen, findet der Fahrplan manchmal einen anderen Ort
+# (z. B. "Herdern" -> Zürich, Herdernstrasse). Liegt die gefundene Haltestelle weiter
+# als das vom Gemeinde-Mittelpunkt weg, ist es der falsche Ort. 15 km, weil auch in den
+# grössten Gemeinden (z. B. Glarus Süd) das Dorf höchstens so weit vom Mittelpunkt liegt.
+MAX_ABSTAND_HALTESTELLE_KM = 15
+
 # openrouteservice: Auto und Velo (Task 2.6)
 ORS_URL = "https://api.openrouteservice.org/v2/matrix/"
 PROFIL_AUTO = "driving-car"
@@ -149,13 +155,20 @@ def naechster_montag() -> str:
     return montag.isoformat()
 
 
-def live_minuten(start: str, ziel: str) -> int | None:
+def oev_ortsname(name: str) -> str:
+    """BFS-Name in Fahrplan-Schreibweise, z. B. "Kilchberg (ZH)" -> "Kilchberg ZH"."""
+    return name.replace(" (", " ").replace(")", "")
+
+
+def live_minuten(start: str, ziel: str,
+                 pruef_lat: float | None = None, pruef_lon: float | None = None) -> int | None:
     """
     Fragt bei transport.opendata.ch die Fahrzeit für eine Verbindung ab.
 
     Parameter:
-        start, ziel: Koordinaten als Text "lat,lon". Mit Koordinaten statt Namen
-                     gibt es keine Verwechslungen (z. B. Rapperswil SG und BE).
+        start, ziel:          Ortsname (z. B. "Kilchberg ZH") oder Koordinaten als Text "lat,lon"
+        pruef_lat, pruef_lon: optional der Gemeinde-Mittelpunkt; liegt die gefundene
+                              Start-Haltestelle zu weit weg, gilt sie als falscher Ort
 
     Rückgabe: Fahrzeit in Minuten,
               KEINE_VERBINDUNG, wenn es keine Verbindung gibt (dauerhaft),
@@ -181,12 +194,20 @@ def live_minuten(start: str, ziel: str) -> int | None:
     verbindungen = r.json()["connections"]
     if len(verbindungen) == 0:
         return KEINE_VERBINDUNG
+
+    if pruef_lat is not None:
+        # Koordinaten der Start-Haltestelle, die der Fahrplan gewählt hat (x = lat, y = lon)
+        haltestelle = verbindungen[0]["from"]["station"]["coordinate"]
+        if haltestelle["x"] is not None:
+            abstand = haversine_km(pruef_lat, pruef_lon, haltestelle["x"], haltestelle["y"])
+            if abstand > MAX_ABSTAND_HALTESTELLE_KM:
+                return KEINE_VERBINDUNG
     return dauer_in_minuten(verbindungen[0]["duration"])
 
 
 def commute_minutes(ziel_lat: float, ziel_lon: float,
                     gemeinden: pd.DataFrame, max_abfragen: int = 50,
-                    fortschritt=None) -> pd.DataFrame:
+                    fortschritt=None, zusaetzlich: list[int] | None = None) -> pd.DataFrame:
     """
     Liefert die Pendelzeit mit dem ÖV von jeder Gemeinde zum Arbeitsort.
 
@@ -200,6 +221,8 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
         max_abfragen:       maximale Anzahl Live-Abfragen
         fortschritt:        optional ein Fortschrittsbalken aus app.py (st.progress),
                             der während der Live-Abfragen nachgeführt wird
+        zusaetzlich:        optional bfs_nr, die ausser den nächsten auch live
+                            abgefragt werden (z. B. die günstigsten, Task 2.8)
 
     Rückgabe: DataFrame mit bfs_nr, pendel_min, pendel_geschaetzt
     """
@@ -218,13 +241,22 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
     resultat["pendel_min"] = schaetze_minuten(resultat["km"]).round(0)
     resultat["pendel_geschaetzt"] = True
 
-    # Schritt 3: Die nächsten Gemeinden sind für die Nutzerin am wichtigsten,
-    # darum ersetzen wir bei ihnen die Schätzung durch die echte Fahrzeit.
+    # Schritt 3: Die nächsten Gemeinden (und die aus "zusaetzlich") sind für die
+    # Nutzerin am wichtigsten, darum fragen wir für sie die echte Fahrzeit ab.
     ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
     naechste = resultat.sort_values("km").head(max_abfragen)
+    if zusaetzlich is not None:
+        extra = resultat[resultat["bfs_nr"].isin(zusaetzlich)]
+        naechste = pd.concat([naechste, extra]).drop_duplicates("bfs_nr")
 
-    # Der Cache liegt in data/cache.db und wird bei Bedarf angelegt (siehe data.py)
+    # Der Cache liegt in data/cache.db und wird bei Bedarf angelegt (siehe data.py).
+    # Alles, was für diesen Arbeitsort schon bekannt ist, auf einmal laden, auch
+    # Gemeinden aus früheren Abfragen (z. B. frühere Runden in app.py, Task 2.8).
     con = get_cache_connection()
+    cache = pd.read_sql("SELECT bfs_nr, minuten FROM pendel_cache WHERE ziel = ?",
+                        con, params=(ziel,))
+    bekannt = dict(zip(cache["bfs_nr"], cache["minuten"]))   # bfs_nr -> minuten
+
     fehler_in_folge = 0
     erledigt = 0
     for index, zeile in naechste.iterrows():
@@ -235,25 +267,25 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
 
         bfs_nr = int(zeile["bfs_nr"])
 
-        # 3a: Zuerst im Cache nachsehen, ob wir diese Verbindung schon kennen
-        gespeichert = con.execute(
-            "SELECT minuten FROM pendel_cache WHERE bfs_nr = ? AND ziel = ?",
-            (bfs_nr, ziel),
-        ).fetchone()
-
-        if gespeichert is not None:
-            minuten = gespeichert[0]
-        else:
-            # 3b: Noch nicht im Cache: live abfragen und für das nächste Mal speichern
+        # Nur live abfragen, was noch nicht im Cache steht
+        if bfs_nr not in bekannt:
             gemeinde = gemeinden.loc[index]
-            start = f"{gemeinde['lat']:.4f},{gemeinde['lon']:.4f}"
-            minuten = live_minuten(start, ziel)
+            # Mit dem Namen sucht der Fahrplan die Haltestelle im Dorfzentrum. Der
+            # Flächenmittelpunkt (lat/lon) liegt bei grossen Gemeinden oft am Berg,
+            # weit weg von jeder Haltestelle (Task 2.8).
+            minuten = live_minuten(oev_ortsname(gemeinde["name"]), ziel,
+                                   gemeinde["lat"], gemeinde["lon"])
+            if minuten == KEINE_VERBINDUNG:
+                # Name nicht gefunden: als Notlösung ab dem Mittelpunkt versuchen
+                start = f"{gemeinde['lat']:.4f},{gemeinde['lon']:.4f}"
+                minuten = live_minuten(start, ziel)
             if minuten is None:
                 fehler_in_folge += 1
             else:
                 fehler_in_folge = 0
             # Auch "keine Verbindung" speichern, nur vorübergehende Fehler (None) nicht
             if minuten is not None:
+                bekannt[bfs_nr] = minuten
                 with con:
                     con.execute(
                         "INSERT OR REPLACE INTO pendel_cache (bfs_nr, ziel, minuten) VALUES (?, ?, ?)",
@@ -261,15 +293,18 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
                     )
             time.sleep(0.2)   # kurze Pause, damit wir die API nicht überlasten (Fair Use)
 
-        # Ohne echte Fahrzeit bleibt einfach die Schätzung stehen
-        if minuten is not None and minuten != KEINE_VERBINDUNG:
-            resultat.loc[index, "pendel_min"] = minuten
-            resultat.loc[index, "pendel_geschaetzt"] = False
-
         erledigt += 1
         if fortschritt is not None:
             fortschritt.progress(erledigt / len(naechste))
     con.close()
+
+    # Schritt 4: Schätzungen durch alle bekannten echten Zeiten ersetzen.
+    # Ohne echte Fahrzeit (keine Verbindung) bleibt einfach die Schätzung stehen.
+    for index, zeile in resultat.iterrows():
+        minuten = bekannt.get(int(zeile["bfs_nr"]))
+        if minuten is not None and minuten != KEINE_VERBINDUNG:
+            resultat.loc[index, "pendel_min"] = minuten
+            resultat.loc[index, "pendel_geschaetzt"] = False
 
     return resultat[["bfs_nr", "pendel_min", "pendel_geschaetzt"]]
 
