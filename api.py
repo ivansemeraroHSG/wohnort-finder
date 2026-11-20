@@ -18,7 +18,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from data import get_connection
+from data import get_cache_connection
 
 SWISSTOPO_URL = "https://api3.geo.admin.ch/rest/services/api/SearchServer"
 TRANSPORT_URL = "https://transport.opendata.ch/v1/connections"
@@ -203,18 +203,8 @@ def commute_minutes(ziel_lat: float, ziel_lon: float,
     ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
     naechste = resultat.sort_values("km").head(max_abfragen)
 
-    con = get_connection()
-    # Gleiche Tabelle wie in scripts/build_db.py. Hier nochmals "falls nicht vorhanden",
-    # damit die App nicht abstürzt, wenn die Datenbank (z. B. online) noch fehlt.
-    with con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS pendel_cache (
-                bfs_nr INTEGER,
-                ziel TEXT,
-                minuten REAL,
-                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (bfs_nr, ziel)
-            )""")
+    # Der Cache liegt in data/cache.db und wird bei Bedarf angelegt (siehe data.py)
+    con = get_cache_connection()
     fehler_in_folge = 0
     erledigt = 0
     for index, zeile in naechste.iterrows():
@@ -296,14 +286,14 @@ if __name__ == "__main__":
     print("Davon mit echter Fahrzeit:", (df["pendel_geschaetzt"] == False).sum())
 
     # Was steht im Cache? Zeigt, wie viele Orte keine Verbindung hatten (-1)
-    con = get_connection()
+    con = get_cache_connection()
     cache = pd.read_sql("SELECT minuten FROM pendel_cache WHERE ziel = '47.3780,8.5400'", con)
     con.close()
     print("Im Cache gespeichert:", len(cache), "davon ohne Verbindung:", (cache["minuten"] == KEINE_VERBINDUNG).sum())
 
     # Testeinträge wieder löschen: Die Fake-Gemeinden haben BFS-Nummern 1–30,
     # die es auch echt gibt. Sonst stünden falsche Zeiten im Cache.
-    con = get_connection()
+    con = get_cache_connection()
     with con:
         con.execute("DELETE FROM pendel_cache WHERE ziel = ?", ("47.3780,8.5400",))
     con.close()
