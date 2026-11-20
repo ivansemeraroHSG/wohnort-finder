@@ -64,6 +64,23 @@ def pendeln_laden(ziel_lat, ziel_lon, ort_name, gemeinden):
     return st.session_state["pendel_oev"], st.session_state["pendel_routen"]
 
 
+def gesamtkosten_berechnen(wohnen, oev, routen, eingaben):
+    """Wohnkosten plus Pendelkosten (bestes Verkehrsmittel) für alle Gemeinden."""
+    df = wohnen.merge(pendel_optionen(wohnen, oev, routen, eingaben), on="bfs_nr")
+    df["gesamtkosten"] = wohnkosten(df) + df["pendel_chf"]
+    return df
+
+
+def kandidaten_sortiert(df, heute_nr, max_pendel, zeitwert):
+    """Gemeinden innerhalb der max. Pendelzeit, sortiert wie die Rangliste im Tab «Ergebnis»."""
+    kandidaten = df[(df["bfs_nr"] != heute_nr) & (df["pendel_min"] <= max_pendel)].copy()
+    if zeitwert is None:
+        kandidaten["rang"] = kandidaten["gesamtkosten"]
+    else:
+        kandidaten["rang"] = persoenliche_kosten({"chf_pro_minute": zeitwert}, kandidaten)
+    return kandidaten.sort_values("rang")
+
+
 # --- Startseite mit Problemstellung (Kriterium 1) ---
 st.title("Wohnort-Finder: Wo bleibt dir am meisten Geld?")
 st.write(
@@ -122,9 +139,28 @@ eingaben = {
     "parkplatz_chf": parkplatz_chf, "hat_ga": hat_ga, "max_pendel_min": max_pendel,
     "zeitwert": zeitwert,
 }
-df = gemeinden.merge(get_tax(einkommen, haushalt), on="bfs_nr").merge(get_rent(zimmer), on="bfs_nr")
-df = df.merge(pendel_optionen(gemeinden, oev, routen, eingaben), on="bfs_nr")
-df["gesamtkosten"] = wohnkosten(df) + df["pendel_chf"]
+wohnen = gemeinden.merge(get_tax(einkommen, haushalt), on="bfs_nr").merge(get_rent(zimmer), on="bfs_nr")
+df = gesamtkosten_berechnen(wohnen, oev, routen, eingaben)
+
+# Task 2.8 (mit Claude erstellt, angepasst von Gregor Weber): Geschätzte ÖV-Zeiten
+# können zu optimistisch sein, und dann rutscht eine schlecht erschlossene Gemeinde
+# nach oben. Darum die günstigsten Kandidaten, deren ÖV-Zeit noch geschätzt ist,
+# live nachfragen und neu rechnen, bis die Top 10 nur echte Zeiten haben.
+if "oev" in verkehrsmittel:
+    for runde in range(MAX_RUNDEN):
+        vorne = kandidaten_sortiert(df, heute_nr, max_pendel, zeitwert)
+        if (vorne.head(ANZAHL_TOP)["oev_geschaetzt"] == False).all():
+            break
+        offen = vorne[vorne["oev_geschaetzt"] == True].head(ANZAHL_LIVE_KANDIDATEN)["bfs_nr"].tolist()
+        balken = st.progress(0.0, text="Echte ÖV-Zeiten für die günstigsten Gemeinden …")
+        neu = commute_minutes(ziel_lat, ziel_lon, gemeinden, fortschritt=balken, zusaetzlich=offen)
+        balken.empty()
+        # Keine einzige neue echte Zeit (z. B. API gestört): nicht weiter versuchen
+        if neu["pendel_geschaetzt"].sum() == oev["pendel_geschaetzt"].sum():
+            break
+        oev = neu
+        st.session_state["pendel_oev"] = neu
+        df = gesamtkosten_berechnen(wohnen, oev, routen, eingaben)
 
 heute = df[df["bfs_nr"] == heute_nr].iloc[0]
 df["ersparnis"] = heute["gesamtkosten"] - df["gesamtkosten"]
@@ -231,6 +267,9 @@ with tab_ergebnis:
         zahlen = [s for s in anzeige.columns if s not in ("Gemeinde", "Kanton", "Verkehrsmittel")]
         anzeige[zahlen] = anzeige[zahlen].round().astype("Int64")
         st.dataframe(anzeige, hide_index=True)
+        if "oev" in verkehrsmittel:
+            echt = (top["oev_geschaetzt"] == False).sum()
+            st.caption(f"ÖV-Zeiten in dieser Rangliste: {echt} echt, {len(top) - echt} geschätzt")
 
     st.caption(
         "Steuern: ESTV, Steuerjahr 2026, ohne Kirchensteuer. Mieten: Schätzung aus BFS-Durchschnitten. "
