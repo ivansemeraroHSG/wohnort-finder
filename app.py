@@ -22,7 +22,8 @@ import random
 import pandas as pd
 import streamlit as st
 
-from api import PROFIL_AUTO, PROFIL_VELO, commute_minutes, geocode, pendel_optionen, route_matrix
+from api import (PROFIL_AUTO, PROFIL_VELO, commute_minutes, geocode, ors_schluessel, pendel_optionen,
+                 route_matrix)
 from charts import kosten_balken, lade_grenzen, map_chart, scatter_chart, tradeoff_chart, zeitwert_chart
 from data import HAUSHALTE, OEV_ABOS, get_municipalities, get_rent, get_tax
 from model import MIN_VERGLEICHE, fit_preferences, make_pairs, persoenliche_kosten, select_for_rating
@@ -188,6 +189,21 @@ def gesamtkosten_berechnen(e, gemeinden, zeitwert=None, nachfragen=False):
     return df, heute
 
 
+def live_nachfragen(e, gemeinden, bfs_nrs):
+    """ÖV-Zeiten dieser Gemeinden live holen (jede nur einmal) und Kosten neu rechnen."""
+    ziel_lat, ziel_lon, _ = e["ort"]
+    versucht = st.session_state.get("live_versucht", set())
+    offen = [int(nr) for nr in bfs_nrs if int(nr) not in versucht]
+    if offen:
+        st.session_state["live_versucht"] = versucht | set(offen)
+        balken = st.progress(0.0, text="Echte ÖV-Verbindungen für die Vergleiche …")
+        st.session_state["pendel_oev"] = commute_minutes(ziel_lat, ziel_lon, gemeinden, fortschritt=balken,
+                                                         zusaetzlich=offen, max_abfragen=0)
+        balken.empty()
+    df, _ = gesamtkosten_berechnen(e, gemeinden)
+    return df
+
+
 def ml_zuruecksetzen():
     """Vergleiche und gelernten Zeitwert löschen (z. B. nach geänderten Eingaben)."""
     for schluessel in ["paare", "antworten", "zeitwert", "zeitwert_10min"]:
@@ -313,7 +329,13 @@ elif schritt == 3:
     )
     # Paare nur einmal bilden: k-means wählt unterschiedliche Gemeinden, daraus echte Trade-offs
     if "paare" not in st.session_state:
-        auswahl = kandidaten[kandidaten["bfs_nr"].isin(select_for_rating(kandidaten))]
+        auswahl_nrs = select_for_rating(kandidaten)
+        # Für die gewählten Gemeinden echte ÖV-Zeiten holen (nur einmal, ca. 12 Abfragen),
+        # damit die Vergleiche nicht auf der Schätzung aus der Luftlinie beruhen
+        if "oev" in e["verkehrsmittel"]:
+            df = live_nachfragen(e, gemeinden, auswahl_nrs)
+            kandidaten = df[(df["bfs_nr"] != e["heute_nr"]) & (df["pendel_min"] <= e["max_pendel"])]
+        auswahl = kandidaten[kandidaten["bfs_nr"].isin(auswahl_nrs)]
         paare = make_pairs(auswahl)
         random.shuffle(paare)
         st.session_state["paare"] = paare
@@ -342,7 +364,8 @@ elif schritt == 3:
                     if pd.isna(g[f"{vm}_min"]):
                         continue
                     name = f"**{VM_NAME[vm]}** :material/check:" if vm == g["bestes_vm"] else VM_NAME[vm]
-                    zeilen.append(f"| {name} | {g[f'{vm}_min']:.0f} Min. | {chf(g[f'{vm}_chf'])} |")
+                    ca = "ca. " if g.get(f"{vm}_geschaetzt", False) == True else ""   # noqa: E712
+                    zeilen.append(f"| {name} | {ca}{g[f'{vm}_min']:.0f} Min. | {chf(g[f'{vm}_chf'])} |")
                 st.markdown("\n".join(zeilen))
                 st.caption(f"Steuern {chf(g['steuer_chf'])} · Miete {chf(g['miete_chf'])} pro Monat")
                 if st.button(f"{g['name']} wählen", key=f"wahl_{buchstabe}", type="primary", width="stretch"):
@@ -382,6 +405,9 @@ else:
     top5 = top["bfs_nr"].head(5).tolist()
 
     st.header("Dein Ergebnis")
+    if ors_schluessel() is None and ({"auto", "velo"} & set(e["verkehrsmittel"])):
+        st.warning("Kein Schlüssel für openrouteservice gefunden: Auto- und Velozeiten sind nur "
+                   "aus der Luftlinie geschätzt.", icon=":material/warning:")
     if top.empty:
         st.warning("Keine Gemeinde liegt innerhalb deiner maximalen Pendelzeit. Erhöhe sie im Schritt Arbeitsweg.")
         st.stop()
@@ -466,10 +492,19 @@ else:
         })
         tabelle.index = range(1, len(tabelle) + 1)
         st.table(tabelle)
+        # Datenquellen sichtbar machen: echte Abfragen oder Schätzung aus der Luftlinie?
+        quellen = []
         if "oev" in e["verkehrsmittel"]:
             echt = int((top["oev_geschaetzt"] == False).sum())   # noqa: E712
-            st.caption(f"ÖV-Zeiten in dieser Rangliste: {echt} aus dem Fahrplan (inkl. Fusswege), "
-                       f"{len(top) - echt} geschätzt.")
+            quellen.append(f"ÖV {echt} von {len(top)} aus dem Fahrplan (inkl. Fusswege)")
+        routen = st.session_state["pendel_routen"].set_index("bfs_nr").loc[top["bfs_nr"]]
+        for vm in ["auto", "velo"]:
+            if vm in e["verkehrsmittel"]:
+                echt = int((routen[f"{vm}_geschaetzt"] == False).sum())   # noqa: E712
+                quellen.append(f"{VM_NAME[vm]} {echt} von {len(top)} aus openrouteservice")
+        if quellen:
+            st.caption("Arbeitswege in dieser Rangliste: " + ", ".join(quellen) +
+                       ". Der Rest ist aus der Luftlinie geschätzt.")
         st.markdown("**Woraus setzen sich die Kosten zusammen?**")
         st.plotly_chart(kosten_balken(df, e["heute_nr"], top5), width="stretch")
 
