@@ -15,6 +15,7 @@ Genutzte APIs (alle kostenlos):
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import date, timedelta
 
@@ -53,6 +54,8 @@ KEINE_VERBINDUNG = -1
 # Zum Namen findet der Fahrplan manchmal einen anderen Ort ("Herdern" -> Zürich, Herdernstrasse).
 # 15 km, weil auch in den grössten Gemeinden das Dorf höchstens so weit vom Mittelpunkt liegt.
 MAX_ABSTAND_HALTESTELLE_KM = 15
+# Bahn-Betriebspunkte ohne Fahrgäste (Weichen, Abzweigungen), stehen bei swisstopo im Feld «detail»
+KEINE_HALTESTELLE = ("spurwechsel", "betriebspunkt", "anschlusspunkt", "abzweigung", "dienststation")
 # Fusswege: Der Fahrplan rechnet nur von Haltestelle zu Haltestelle (Umsteigezeiten sind
 # darin schon enthalten). Dazu kommen der Weg von zu Hause zur Haltestelle und von der
 # Ziel-Haltestelle zum Arbeitsort.
@@ -92,13 +95,19 @@ def geocode(adresse: str) -> tuple[float, float, str] | None:
     if r.status_code != 200 or len(r.json()["results"]) == 0:
         return None
 
-    attrs = r.json()["results"][0]["attrs"]   # swisstopo liefert den besten Treffer zuerst
-    name = attrs["label"]
-    for tag in ["<b>", "</b>", "<i>", "</i>"]:   # HTML-Formatierung, für uns unnötig
+    # swisstopo liefert den besten Treffer zuerst. Bahn-Betriebspunkte (z. B. eine Weiche
+    # «Zürich HB SZU Süd (Spw)») sind aber keine Haltestellen: die überspringen wir.
+    treffer = r.json()["results"]
+    attrs = treffer[0]["attrs"]
+    for resultat in treffer:
+        detail = resultat["attrs"].get("detail", "")
+        if not any(wort in detail for wort in KEINE_HALTESTELLE):
+            attrs = resultat["attrs"]
+            break
+    # Label aufräumen: <i>…</i> enthält nur die Quelle oder ein Symbol (z. B. «train»)
+    name = re.sub(r"<i>.*?</i>", "", attrs["label"])
+    for tag in ["<b>", "</b>", "<i>", "</i>"]:
         name = name.replace(tag, "")
-    # Manche Treffer beginnen mit dem Namen der Datenquelle, z. B. "haltestellen_ Zürich HB"
-    if "_ " in name:
-        name = name.split("_ ", 1)[1]
     return (attrs["lat"], attrs["lon"], name.strip())
 
 
