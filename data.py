@@ -1,236 +1,194 @@
 """
-data.py – Zugriff auf die SQLite-Datenbank (Arbeitspaket 1).
+data.py – Zugriff auf die Datenbank und feste Kostenwerte (Arbeitspaket 1).
 
 Verantwortlich: Ivan
-Funktionen get_municipalities bis save_rating: mit Claude erstellt, angepasst von Ivan
+KI-Hinweis: Mit Claude (Anthropic) erstellt; am 24.11.2026 mit Claude vereinfacht
+(Branch WF-5.6-Umbau).
 
-Alle Funktionen geben pandas-DataFrames mit den vereinbarten Spaltennamen zurück:
-bfs_nr, name, kanton, lat, lon, gemeindetyp, steuer_chf,
-miete_chf, miete_geschaetzt, pendel_min, pendel_geschaetzt, score.
-Verknüpft werden sie immer über bfs_nr.
+Die Daten liegen in der SQLite-Datenbank data/wohnort.db (gebaut von scripts/build_db.py).
+Wir lesen sie wie in Übung 7: Verbindung mit sqlite3, Abfrage mit pd.read_sql und SELECT.
+Alle Tabellen werden über die BFS-Nummer (bfs_nr) der Gemeinde verknüpft.
 """
 
-from __future__ import annotations
-
-import math
 import sqlite3
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-# Pfad zur Datenbank (wird von scripts/build_db.py erzeugt)
+# Pfade zu den Datenbanken (Path wie in Übung 7)
 DB_PATH = Path(__file__).parent / "data" / "wohnort.db"
-# Zwischenspeicher für API-Antworten. Eigene Datei, die nicht auf GitHub kommt
-# (.gitignore), damit sich wohnort.db beim Benutzen der App nicht ändert.
+# Zwischenspeicher (Cache) für API-Antworten. Eigene Datei, die nicht auf GitHub kommt
+# (steht in .gitignore). So ändert sich wohnort.db beim Benutzen der App nicht.
 CACHE_PATH = Path(__file__).parent / "data" / "cache.db"
 
+# Haushaltstypen, für die wir Steuerdaten haben
 HAUSHALTE = ["ledig", "verheiratet", "verheiratet_2_kinder"]
 
-# --- Kostenansätze fürs Pendeln (Task 1.7), Stand November 2026 ---
-# GA Erwachsene 2. Klasse ab Fahrplanwechsel Dezember 2026 (Alliance SwissPass / SBB)
+# Einkommen, für die wir Steuerdaten haben (CHF pro Jahr, brutto)
+EINKOMMENSSTUFEN = [50000, 75000, 100000, 150000, 200000, 300000]
+
+# --- Feste Kostenwerte fürs Pendeln (Quellen: data/raw/QUELLEN.md) ---
+
+# Jahres-Strecken-Abo 2. Klasse: (bis so viele km, Preis pro Jahr in CHF).
+# Abgelesen aus dem Tarif T650 von Alliance SwissPass (Ausgabe 01.06.2026).
+OEV_PREISE = [
+    (5, 684),
+    (10, 999),
+    (15, 1314),
+    (20, 1602),
+    (30, 1953),
+    (40, 2295),
+    (50, 2493),
+    (60, 2682),
+    (70, 2853),
+    (80, 3024),
+    (100, 3375),
+    (120, 3717),
+]
+# Wer weiter fährt, kauft ein GA (2. Klasse, ab Dezember 2026)
 GA_PREIS = 4095
-# Strecken-Abo, Tarif T650 von Alliance SwissPass (Ausgabe 01.06.2026, Ziffer 4.1):
-# Grundpreis 1 Monat, Erwachsene, 2. Klasse in CHF pro km, mit Rabatt je weiter die Strecke
-STRECKENABO_CHF_PRO_KM = 17.22
-# (bis Kilometer, Anteil des Grundpreises) für jede Distanzstufe
-STRECKENABO_STAFFELUNG = [(4, 1.0), (14, 0.406), (20, 0.375), (39, 0.227), (54, 0.131), (250, 0.112)]
-# Jahres-Abo = 9 Monatspreise (T650, Ziffer 4.1.7)
-MONATE_PRO_JAHRESABO = 9
-# TCS Kilometerkosten 2026 (Musterauto, 15'000 km pro Jahr): total 74 Rp./km;
-# variable Kosten (Energie, Unterhalt, Reifen) 4'135 CHF / 15'000 km = 28 Rp./km.
-# Wer schon ein Auto hat, zahlt fürs Pendeln nur die variablen Kosten.
-AUTO_CHF_PRO_KM_VARIABEL = 0.28
-AUTO_CHF_PRO_KM_TOTAL = 0.74
-# Abo-Arten, die die Nutzerin wählen kann (Schlüssel für oev_abopreis)
-OEV_ABOS = {
-    "guenstigstes": "Günstigstes automatisch (Strecken-Abo oder GA)",
-    "jahr": "Jahres-Strecken-Abo",
-    "monat": "Monats-Strecken-Abo (monatlich kündbar)",
-    "ga": "GA neu kaufen",
-    "ga_vorhanden": "GA habe ich schon (kostet nichts zusätzlich)",
-}
+
+# Auto, TCS-Kilometerkosten 2026: mit Kauf und Versicherung 74 Rp. pro km,
+# nur Benzin, Unterhalt und Reifen 28 Rp. pro km (wenn man schon ein Auto hat)
+AUTO_CHF_PRO_KM = 0.74
+AUTO_CHF_PRO_KM_VORHANDEN = 0.28
+
 # Arbeitswochen pro Jahr (52 Wochen minus Ferien und Feiertage)
 ARBEITSWOCHEN = 46
 
 
-def oev_monatspreis(km: float) -> float:
-    """Preis eines Monats-Strecken-Abos (Erwachsene, 2. Klasse) in CHF nach Tarif T650."""
-    km = max(4, math.ceil(km))   # Mindestpreis ist der Preis für 4 km
-    monatspreis = 0.0
-    bisher = 0
-    for bis_km, anteil in STRECKENABO_STAFFELUNG:
-        km_in_stufe = min(km, bis_km) - bisher
-        if km_in_stufe <= 0:
-            break
-        monatspreis += km_in_stufe * STRECKENABO_CHF_PRO_KM * anteil
-        bisher = bis_km
-    return math.ceil(monatspreis)   # der Tarif rundet auf den nächsten Franken auf
-
-
-def oev_abopreis(km: float, abo: str = "guenstigstes") -> float:
+def get_municipalities():
     """
-    ÖV-Kosten pro Jahr in CHF für eine Strecke, je nach Abo.
+    Liefert alle Gemeinden.
+
+    Rückgabe: DataFrame mit bfs_nr, name, kanton, lat, lon
+    """
+    con = sqlite3.connect(DB_PATH)
+    gemeinden = pd.read_sql("SELECT bfs_nr, name, kanton, lat, lon FROM gemeinden ORDER BY name", con)
+    con.close()
+    return gemeinden
+
+
+def get_tax(einkommen, haushalt):
+    """
+    Liefert die Einkommenssteuer pro Gemeinde (CHF pro Jahr).
+
+    In der Datenbank stehen nur die Einkommen aus EINKOMMENSSTUFEN. Für ein Einkommen
+    dazwischen rechnen wir mit einem Dreisatz zwischen der Stufe darunter und darüber.
+    Beispiel: 125'000 CHF liegt genau in der Mitte zwischen 100'000 und 150'000,
+    also nehmen wir die Steuer in der Mitte zwischen diesen beiden Stufen.
 
     Parameter:
-        km:  Tarifkilometer der Strecke (ungefähr die Strassendistanz, nicht die Luftlinie)
-        abo: "guenstigstes" (Jahres-Strecken-Abo oder GA, was günstiger ist),
-             "jahr" (Jahres-Strecken-Abo), "monat" (12 Monats-Strecken-Abos, monatlich kündbar),
-             "ga" (GA neu kaufen) oder "ga_vorhanden" (GA schon bezahlt, kostet nichts zusätzlich)
+        einkommen: Bruttoeinkommen in CHF pro Jahr
+        haushalt:  "ledig", "verheiratet" oder "verheiratet_2_kinder"
+
+    Rückgabe: DataFrame mit bfs_nr, steuer_chf
     """
-    if abo == "ga_vorhanden":
-        return 0
-    if abo == "ga":
-        return GA_PREIS
-    if abo == "monat":
-        return 12 * oev_monatspreis(km)
-    jahresabo = oev_monatspreis(km) * MONATE_PRO_JAHRESABO   # 9 Monate zahlen, 12 fahren
-    if abo == "jahr":
-        return jahresabo
-    return min(jahresabo, GA_PREIS)
+    # Einkommen auf den Bereich begrenzen, für den wir Daten haben
+    if einkommen < EINKOMMENSSTUFEN[0]:
+        einkommen = EINKOMMENSSTUFEN[0]
+    if einkommen > EINKOMMENSSTUFEN[-1]:
+        einkommen = EINKOMMENSSTUFEN[-1]
+
+    # Die Stufe darunter und die Stufe darüber suchen
+    unten = EINKOMMENSSTUFEN[0]
+    oben = EINKOMMENSSTUFEN[1]
+    for i in range(len(EINKOMMENSSTUFEN) - 1):
+        if EINKOMMENSSTUFEN[i] <= einkommen <= EINKOMMENSSTUFEN[i + 1]:
+            unten = EINKOMMENSSTUFEN[i]
+            oben = EINKOMMENSSTUFEN[i + 1]
+            break
+
+    # Steuern für beide Stufen aus der Datenbank lesen
+    abfrage = "SELECT bfs_nr, steuer_chf FROM steuern WHERE haushalt = ? AND einkommen = ?"
+    con = sqlite3.connect(DB_PATH)
+    steuer_unten = pd.read_sql(abfrage, con, params=(haushalt, unten))
+    steuer_oben = pd.read_sql(abfrage, con, params=(haushalt, oben))
+    con.close()
+
+    # Beide Tabellen nebeneinander stellen (verknüpft über bfs_nr)
+    steuer_unten = steuer_unten.rename(columns={"steuer_chf": "steuer_unten"})
+    steuer_oben = steuer_oben.rename(columns={"steuer_chf": "steuer_oben"})
+    steuern = steuer_unten.merge(steuer_oben, on="bfs_nr")
+
+    # Dreisatz: Wie weit liegt das Einkommen zwischen den beiden Stufen? (0 = unten, 1 = oben)
+    anteil = (einkommen - unten) / (oben - unten)
+    steuern["steuer_chf"] = steuern["steuer_unten"] + anteil * (steuern["steuer_oben"] - steuern["steuer_unten"])
+    steuern["steuer_chf"] = steuern["steuer_chf"].round()
+    return steuern[["bfs_nr", "steuer_chf"]]
 
 
-def get_connection() -> sqlite3.Connection:
-    """Öffnet eine Verbindung zur SQLite-Datenbank und gibt sie zurück."""
-    return sqlite3.connect(DB_PATH)
+def get_rent(zimmer):
+    """
+    Liefert die geschätzte Monatsmiete pro Gemeinde für eine Zimmerzahl.
+
+    Das BFS publiziert Mieten nur pro Kanton und pro Gemeindetyp. Die Miete pro
+    Gemeinde schätzt scripts/build_db.py aus diesen beiden Werten.
+
+    Parameter:
+        zimmer: Anzahl Zimmer, 1 bis 6 (6 bedeutet "6 und mehr")
+
+    Rückgabe: DataFrame mit bfs_nr, miete_chf (CHF pro Monat)
+    """
+    con = sqlite3.connect(DB_PATH)
+    mieten = pd.read_sql("SELECT bfs_nr, miete_chf FROM mieten WHERE zimmer = ?", con, params=(zimmer,))
+    con.close()
+    return mieten
 
 
-def get_cache_connection() -> sqlite3.Connection:
-    """Öffnet den Cache für API-Antworten und legt Datei und Tabellen bei Bedarf an."""
+def get_cache_connection():
+    """Öffnet den Cache für API-Antworten und legt die Tabellen an, falls sie fehlen."""
     con = sqlite3.connect(CACHE_PATH)
     with con:
         # ÖV-Fahrzeit pro Gemeinde und Arbeitsort (transport.opendata.ch)
         con.execute("""
-            CREATE TABLE IF NOT EXISTS pendel_cache (
+            CREATE TABLE IF NOT EXISTS oev_zeiten (
                 bfs_nr INTEGER,
                 ziel TEXT,
-                minuten REAL,
-                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (bfs_nr, ziel)
+                minuten REAL
             )""")
-        # Auto und Velo pro Gemeinde und Arbeitsort (openrouteservice, Task 2.6)
+        # Auto- und Velozeit pro Gemeinde und Arbeitsort (openrouteservice)
         con.execute("""
             CREATE TABLE IF NOT EXISTS route_cache (
                 bfs_nr INTEGER,
                 ziel TEXT,
                 profil TEXT,
                 minuten REAL,
-                km REAL,
-                abgefragt_am TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (bfs_nr, ziel, profil)
+                km REAL
             )""")
     return con
 
 
-def get_municipalities() -> pd.DataFrame:
+def oev_kosten(km):
+    """ÖV-Kosten pro Jahr in CHF: Jahres-Strecken-Abo aus der Tabelle OEV_PREISE, sonst GA."""
+    for bis_km, preis in OEV_PREISE:
+        if km <= bis_km:
+            return preis
+    return GA_PREIS
+
+
+def auto_kosten(km, buerotage, hat_auto):
     """
-    Liefert alle Gemeinden.
-
-    Rückgabe: DataFrame mit bfs_nr, name, kanton, lat, lon, gemeindetyp, typ_gruppe
-    """
-    with get_connection() as con:
-        return pd.read_sql(
-            "SELECT bfs_nr, name, kanton, lat, lon, gemeindetyp, typ_gruppe "
-            "FROM gemeinden ORDER BY name",
-            con,
-        )
-
-
-def get_tax(einkommen: int, haushalt: str) -> pd.DataFrame:
-    """
-    Liefert die Steuerbelastung pro Gemeinde für ein Einkommen und einen Haushaltstyp.
-
-    In der Datenbank stehen nur einige Einkommensstufen (50'000 bis 300'000 CHF).
-    Dazwischen wird linear interpoliert, ausserhalb gilt die nächste Stufe.
+    Auto-Kosten pro Jahr in CHF.
 
     Parameter:
-        einkommen: Bruttoeinkommen in CHF pro Jahr
-        haushalt:  "ledig", "verheiratet" oder "verheiratet_2_kinder"
-
-    Rückgabe: DataFrame mit bfs_nr, steuer_chf (CHF pro Jahr)
+        km:        Strassendistanz für eine Strecke
+        buerotage: Tage pro Woche, an denen man ins Büro fährt
+        hat_auto:  True = Auto ist schon da, es zählen nur die Fahrkosten
     """
-    if haushalt not in HAUSHALTE:
-        raise ValueError(f"Unbekannter Haushalt: {haushalt}")
-    with get_connection() as con:
-        steuern = pd.read_sql(
-            "SELECT bfs_nr, einkommen, steuer_chf FROM steuern WHERE haushalt = ?",
-            con,
-            params=(haushalt,),
-        )
-    # Eine Zeile pro Gemeinde, eine Spalte pro Einkommensstufe
-    tabelle = steuern.pivot(index="bfs_nr", columns="einkommen", values="steuer_chf")
-    stufen = tabelle.columns.to_numpy()
-    werte = [np.interp(einkommen, stufen, zeile) for zeile in tabelle.to_numpy()]
-    return pd.DataFrame({"bfs_nr": tabelle.index, "steuer_chf": np.round(werte)})
+    if hat_auto:
+        preis_pro_km = AUTO_CHF_PRO_KM_VORHANDEN
+    else:
+        preis_pro_km = AUTO_CHF_PRO_KM
+    # hin und zurück = 2 Strecken pro Bürotag
+    km_pro_jahr = km * 2 * buerotage * ARBEITSWOCHEN
+    return round(km_pro_jahr * preis_pro_km)
 
 
-def get_rent(zimmer: int) -> pd.DataFrame:
-    """
-    Liefert die geschätzte Monatsmiete pro Gemeinde für eine Zimmerzahl.
-
-    Das BFS publiziert Mieten nur pro Kanton und pro Gemeindetyp. Die Werte pro
-    Gemeinde schätzt scripts/build_db.py aus beiden (Tabelle "mieten").
-
-    Parameter:
-        zimmer: Anzahl Zimmer, 1 bis 6 (6 = "6 und mehr")
-
-    Rückgabe: DataFrame mit bfs_nr, miete_chf (CHF pro Monat), miete_geschaetzt (bool)
-    """
-    zimmer = min(max(int(zimmer), 1), 6)
-    with get_connection() as con:
-        mieten = pd.read_sql(
-            "SELECT bfs_nr, miete_chf, miete_geschaetzt FROM mieten WHERE zimmer = ?",
-            con,
-            params=(zimmer,),
-        )
-    mieten["miete_geschaetzt"] = mieten["miete_geschaetzt"].astype(bool)
-    return mieten
-
-
-def save_rating(bfs_nr: int, gefaellt: bool, sitzung: str) -> None:
-    """
-    Speichert eine Bewertung (anonym) in der Tabelle "bewertungen".
-
-    Parameter:
-        bfs_nr:   BFS-Nummer der bewerteten Gemeinde
-        gefaellt: True = gefällt, False = gefällt nicht
-        sitzung:  zufällige ID der Sitzung (keine Personendaten)
-    """
-    with get_connection() as con:
-        con.execute(
-            "INSERT INTO bewertungen (sitzung, bfs_nr, gefaellt) VALUES (?, ?, ?)",
-            (sitzung, int(bfs_nr), int(gefaellt)),
-        )
-
-
-def fake_municipalities(n: int = 30, seed: int = 42) -> pd.DataFrame:
-    """
-    Erzeugt erfundene Gemeinden mit allen vereinbarten Spalten.
-
-    Damit können AP 3, 4 und 5 arbeiten, bevor die echten Daten bereit sind.
-
-    Parameter:
-        n:    Anzahl erfundener Gemeinden
-        seed: Startwert für den Zufallsgenerator (gleiche Daten bei jedem Aufruf)
-
-    Rückgabe: DataFrame mit allen Standardspalten (score ist leer)
-    """
-    rng = np.random.default_rng(seed)
-    kantone = ["ZH", "SG", "ZG", "SZ", "BE", "LU", "AG", "TG"]
-    df = pd.DataFrame({
-        "bfs_nr": np.arange(1, n + 1),
-        "name": [f"Testgemeinde {i}" for i in range(1, n + 1)],
-        "kanton": rng.choice(kantone, n),
-        # Koordinaten ungefähr innerhalb der Schweiz
-        "lat": rng.uniform(46.2, 47.6, n).round(4),
-        "lon": rng.uniform(6.5, 9.8, n).round(4),
-        "gemeindetyp": rng.choice(["städtisch", "intermediär", "ländlich"], n),
-        "einwohner": rng.integers(800, 40000, n),
-        "steuer_chf": rng.integers(6000, 22000, n),
-        "miete_chf": rng.integers(1300, 3200, n),
-        "miete_geschaetzt": rng.choice([True, False], n),
-        "pendel_min": rng.integers(10, 90, n),
-        "pendel_geschaetzt": rng.choice([True, False], n),
-    })
-    df["score"] = np.nan
-    return df
+# --- Kurzer Test: läuft nur bei "python data.py", nicht wenn app.py die Datei importiert ---
+if __name__ == "__main__":
+    print(get_municipalities().head())
+    print(get_tax(125000, "ledig").head())
+    print(get_rent(3).head())
+    print("ÖV 12 km:", oev_kosten(12), "CHF, ÖV 200 km:", oev_kosten(200), "CHF")
+    print("Auto 20 km, 5 Tage:", auto_kosten(20, 5, False), "CHF")

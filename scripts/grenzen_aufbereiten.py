@@ -1,21 +1,33 @@
-"""Passt die BFS-Gemeindegrenzen (Stand 1.1.2025) an die Gemeindeliste 2026 an."""
-# Mit Claude erstellt, angepasst von Ivan
-#
-# Ausführen im Projektordner:  python scripts/grenzen_aufbereiten.py
-# Ergebnis: data/gemeindegrenzen_2026.geojson (wird von der Karte in der App gelesen)
+"""
+grenzen_aufbereiten.py – passt die BFS-Gemeindegrenzen (Stand 1.1.2025) an die Gemeinden 2026 an.
+
+Verantwortlich: Ivan (Arbeitspaket 1)
+KI-Hinweis: Mit Claude (Anthropic) erstellt; am 24.11.2026 mit Claude vereinfacht
+(Branch WF-5.6-Umbau).
+
+Warum braucht es das? Die Grenzen-Datei des BFS ist von 2025, unsere Gemeindeliste von 2026.
+Dazwischen haben einige Gemeinden fusioniert. Dieses Skript gibt den Flächen der alten
+Gemeinden die neue BFS-Nummer. build_db.py berechnet daraus die Koordinaten jeder Gemeinde.
+
+Ausführen im Projektordner:  python scripts/grenzen_aufbereiten.py
+Ergebnis: data/gemeindegrenzen_2026.geojson
+
+GeoJSON ist ein Textformat für Karten. Python liest es mit json.load() als Dictionary ein,
+genau wie die Antworten der APIs in Übung 6 und 7.
+"""
 
 import json
 from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
-QUELLE = ROOT / "data" / "raw" / "gemeindegrenzen" / "Communes_K4_20250101_4326.geojson"
-GEMEINDEN = ROOT / "data" / "raw" / "gemeinden_2026.csv"
-ZIEL = ROOT / "data" / "gemeindegrenzen_2026.geojson"
+ORDNER = Path(__file__).parent.parent
+QUELLE = ORDNER / "data" / "raw" / "gemeindegrenzen" / "Communes_K4_20250101_4326.geojson"
+GEMEINDEN = ORDNER / "data" / "raw" / "gemeinden_2026.csv"
+ZIEL = ORDNER / "data" / "gemeindegrenzen_2026.geojson"
 
-# Gemeinden, die zwischen dem 1.1.2025 und dem 1.1.2026 fusioniert haben
-# oder eine neue BFS-Nummer bekamen: alte Nummer -> neue Nummer
+# Gemeinden, die zwischen dem 1.1.2025 und dem 1.1.2026 fusioniert haben oder
+# eine neue BFS-Nummer bekamen: alte Nummer -> neue Nummer
 # Quelle: Amtliches Gemeindeverzeichnis BFS, Mutationen 2025
 FUSIONEN = {
     700: 6831,    # Moutier wechselt von BE zu JU
@@ -34,49 +46,53 @@ FUSIONEN = {
     5207: 5395,   # Novaggio -> Lema
 }
 
+# Grenzen 2025 einlesen
+with open(QUELLE, encoding="utf-8") as datei:
+    grenzen_2025 = json.load(datei)
 
-def polygone(geometrie):
-    """Gibt die Flächen einer Geometrie immer als Liste von Polygonen zurück."""
+# Alle Flächen pro Gemeinde 2026 sammeln (Dictionary: neue BFS-Nummer -> Liste von Flächen).
+# Bei einer Fusion landen die Flächen mehrerer alter Gemeinden bei derselben neuen Nummer.
+flaechen = {}
+for gemeinde in grenzen_2025["features"]:
+    alte_nr = gemeinde["properties"]["GDENR"]
+    if alte_nr in FUSIONEN:
+        neue_nr = FUSIONEN[alte_nr]
+    else:
+        neue_nr = alte_nr
+    if neue_nr not in flaechen:
+        flaechen[neue_nr] = []
+
+    # Eine Gemeinde ist ein «Polygon» (eine Fläche) oder ein «MultiPolygon» (mehrere Flächen).
+    # Wir speichern immer eine Liste von Flächen.
+    geometrie = gemeinde["geometry"]
     if geometrie["type"] == "Polygon":
-        return [geometrie["coordinates"]]
-    return geometrie["coordinates"]
+        flaechen[neue_nr].append(geometrie["coordinates"])
+    else:
+        for polygon in geometrie["coordinates"]:
+            flaechen[neue_nr].append(polygon)
 
+# Namen der Gemeinden 2026 (Dictionary: BFS-Nummer -> Name)
+gemeinden = pd.read_csv(GEMEINDEN)
+namen = {}
+for nr, name in zip(gemeinden["BfsCode"], gemeinden["Name"]):
+    namen[nr] = name
 
-def main():
-    """Fasst fusionierte Gemeinden zusammen und speichert sie mit BFS-Nummer 2026."""
-    with open(QUELLE, encoding="utf-8") as datei:
-        grenzen_2025 = json.load(datei)
+# Neue GeoJSON-Datei zusammenbauen: eine Fläche pro Gemeinde 2026
+features = []
+for bfs_nr in flaechen:
+    features.append({
+        "type": "Feature",
+        "properties": {"bfs_nr": bfs_nr, "name": namen.get(bfs_nr)},
+        "geometry": {"type": "MultiPolygon", "coordinates": flaechen[bfs_nr]},
+    })
+with open(ZIEL, "w", encoding="utf-8") as datei:
+    json.dump({"type": "FeatureCollection", "features": features}, datei)
 
-    # Alle Flächen einer neuen Gemeinde sammeln (bei Fusionen mehrere alte Gemeinden)
-    flaechen = {}
-    for gemeinde in grenzen_2025["features"]:
-        alte_nr = gemeinde["properties"]["GDENR"]
-        neue_nr = FUSIONEN.get(alte_nr, alte_nr)
-        flaechen.setdefault(neue_nr, []).extend(polygone(gemeinde["geometry"]))
-
-    gemeinden = pd.read_csv(GEMEINDEN)
-    namen = dict(zip(gemeinden["BfsCode"], gemeinden["Name"]))
-
-    features = [
-        {
-            "type": "Feature",
-            "id": bfs_nr,
-            "properties": {"bfs_nr": bfs_nr, "name": namen.get(bfs_nr)},
-            "geometry": {"type": "MultiPolygon", "coordinates": polygon_liste},
-        }
-        for bfs_nr, polygon_liste in flaechen.items()
-    ]
-    with open(ZIEL, "w", encoding="utf-8") as datei:
-        json.dump({"type": "FeatureCollection", "features": features}, datei)
-
-    # Kontrolle: Jede Gemeinde der Liste 2026 braucht genau eine Fläche
-    ohne_flaeche = set(namen) - set(flaechen)
-    ohne_gemeinde = set(flaechen) - set(namen)
-    print(f"Flächen 2025: {len(grenzen_2025['features'])}, Gemeinden 2026: {len(features)}")
-    print(f"Gemeinden ohne Fläche: {sorted(ohne_flaeche) or 'keine'}")
-    print(f"Flächen ohne Gemeinde: {sorted(ohne_gemeinde) or 'keine'}")
-    print(f"Fertig: {ZIEL}")
-
-
-if __name__ == "__main__":
-    main()
+# Kontrolle: Jede Gemeinde der Liste 2026 braucht genau eine Fläche
+ohne_flaeche = []
+for nr in namen:
+    if nr not in flaechen:
+        ohne_flaeche.append(nr)
+print("Flächen 2025:", len(grenzen_2025["features"]), "| Gemeinden 2026:", len(features))
+print("Gemeinden ohne Fläche:", ohne_flaeche)
+print("Fertig:", ZIEL)

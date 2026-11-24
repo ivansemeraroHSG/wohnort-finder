@@ -1,20 +1,17 @@
 """
-scoring.py – Wohnkosten pro Gemeinde (Arbeitspaket 5).
+scoring.py – Gesamtkosten pro Gemeinde (Arbeitspaket 5).
 
 Verantwortlich: Ivan
-Mit Claude erstellt, angepasst von Ivan
+KI-Hinweis: Mit Claude (Anthropic) erstellt; am 24.11.2026 mit Claude vereinfacht
+(Branch WF-5.6-Umbau).
 
-Die Wohnkosten sind die Grundlage des Rankings und der Fallback, wenn eine
-Nutzerin noch zu wenige Gemeinden bewertet hat, um das ML-Modell zu trainieren.
+Die Gesamtkosten sind die Grundlage der Rangliste. Sie gelten auch, solange das
+ML-Modell noch nicht trainiert ist (zu wenige Bewertungen).
 """
-
-from __future__ import annotations
-
-import pandas as pd
 
 MONATE = 12
 
 
-def wohnkosten(df: pd.DataFrame) -> pd.Series:
-    """Wohnkosten in CHF pro Jahr: Steuern plus zwölf Monatsmieten."""
-    return df["steuer_chf"] + MONATE * df["miete_chf"]
+def gesamtkosten(df):
+    """Kosten in CHF pro Jahr: Steuern + 12 Monatsmieten + Pendelkosten."""
+    return df["steuer_chf"] + MONATE * df["miete_chf"] + df["pendel_chf"]
