@@ -1,7 +1,18 @@
-"""Lädt die Steuerbelastung aller Gemeinden vom ESTV-Steuerrechner und speichert sie als CSV."""
-# Die ESTV hat keine offizielle API. Wir nutzen die Schnittstelle, mit der die Webseite
-# swisstaxcalculator.estv.admin.ch selbst ihre Karte füllt. Darum läuft das Skript nur
-# einmal beim Aufbau der Datenbank und nie live in der App.
+"""
+steuern_laden.py – lädt die Steuerbelastung aller Gemeinden vom ESTV-Steuerrechner (einmalig).
+
+Verantwortlich: Ivan (Arbeitspaket 1)
+KI-Hinweis: Mit Claude (Anthropic) erstellt; Kommentare am 24.11.2026 mit Claude ergänzt
+(Branch WF-5.6-Umbau).
+
+Die ESTV hat keine offizielle API. Wir nutzen die Schnittstelle, mit der die Webseite
+swisstaxcalculator.estv.admin.ch selbst ihre Karte füllt. Die Felder in «anfrage»
+sind dieselben, die die Webseite beim geografischen Vergleich sendet.
+Darum läuft das Skript nur einmal beim Aufbau der Daten und nie live in der App.
+Ergebnis: data/raw/steuern_2026.csv (liegt schon im Projekt, muss nicht neu geladen werden).
+
+Ausführen im Projektordner:  python scripts/steuern_laden.py
+"""
 
 import time
 from pathlib import Path
@@ -16,7 +27,7 @@ ZIEL = Path(__file__).resolve().parent.parent / "data" / "raw" / "steuern_2026.c
 # Nummer des Haushaltstyps im ESTV-Formular -> unser Name
 HAUSHALTE = {1: "ledig", 5: "verheiratet", 7: "verheiratet_2_kinder"}
 
-# Bruttoarbeitseinkommen in CHF; für Werte dazwischen interpoliert die App
+# Bruttoarbeitseinkommen in CHF; für Werte dazwischen rechnet die App mit einem Dreisatz
 EINKOMMEN = [50_000, 75_000, 100_000, 150_000, 200_000, 300_000]
 
 PAUSE_SEK = 2  # inoffizielle Schnittstelle, darum bewusst langsam abfragen
@@ -42,6 +53,7 @@ def abfragen(haushalt_nr, einkommen):
         "considerMaximumExposureLimit": False,
         "investmentIncome": None,
     }
+    # POST statt GET, weil die Webseite die Anfrage als JSON schickt (wie bei openrouteservice)
     antwort = requests.post(URL, json=anfrage, timeout=60)
     antwort.raise_for_status()
     return antwort.json()["data"]

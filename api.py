@@ -2,20 +2,18 @@
 api.py – Arbeitsort und Pendeln: Koordinaten, Pendelzeiten und Pendelkosten (Arbeitspaket 2).
 
 Verantwortlich: Gregor Weber
-Mit Claude erstellt, angepasst von Gregor Weber
-Fusswege zum/vom ÖV, Abo-Wahl, Lieblings-Verkehrsmittel (20.11.): mit Claude erstellt, angepasst von Ivan
+KI-Hinweis: Mit Claude (Anthropic) erstellt; am 24.11.2026 mit Claude vereinfacht
+(Branch WF-5.6-Umbau). openrouteservice-Abfrage: umgesetzt im Team, mit Claude kommentiert.
 
 Genutzte APIs (alle kostenlos):
-- swisstopo SearchServer:  Adresse -> Koordinaten
-- transport.opendata.ch:   ÖV-Verbindungen
-- openrouteservice Matrix: Auto und Velo. Braucht einen Schlüssel, lokal in
-  .streamlit/secrets.toml, online in den Einstellungen von Streamlit Cloud.
+- swisstopo SearchServer:  Adresse -> Koordinaten (GET, wie in Übung 6/7)
+- transport.opendata.ch:   ÖV-Verbindungen (GET, wie in Übung 7)
+- openrouteservice:        Fahrzeit mit Auto und Velo (POST, braucht einen Schlüssel).
+  Der Schlüssel steht lokal in .streamlit/secrets.toml, online in den Einstellungen
+  von Streamlit Cloud (st.secrets, wie in der Streamlit-Demo von Übung 7).
 """
 
-from __future__ import annotations
-
 import math
-import re
 import time
 from datetime import date, timedelta
 
@@ -23,97 +21,93 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from data import (ARBEITSWOCHEN, AUTO_CHF_PRO_KM_TOTAL, AUTO_CHF_PRO_KM_VARIABEL,
-                  get_cache_connection, oev_abopreis)
+from data import auto_kosten, get_cache_connection, oev_kosten
 
 SWISSTOPO_URL = "https://api3.geo.admin.ch/rest/services/api/SearchServer"
 TRANSPORT_URL = "https://transport.opendata.ch/v1/connections"
 ORS_URL = "https://api.openrouteservice.org/v2/matrix/"
 
-# --- Abfragen ---
-TIMEOUT_SEK = 10          # danach aufgeben, statt die App hängen zu lassen
-ORS_TIMEOUT_SEK = 30      # eine Matrix für alle 2'110 Gemeinden braucht einige Sekunden
-GEOCODE_CACHE_SEK = 600   # nach 10 Min. neu fragen, damit ein Fehler (None) nicht hängen bleibt
-ABFAHRT = "07:30"         # typische Pendlerzeit, macht alle Gemeinden vergleichbar
-MAX_LIVE_ABFRAGEN = 50    # Fair Use von transport.opendata.ch
-PAUSE_SEK = 0.2           # zwischen zwei ÖV-Abfragen, ebenfalls Fair Use
-MAX_FEHLER_IN_FOLGE = 3   # so oft hintereinander keine Antwort: API gestört, Rest bleibt geschätzt
+# --- Einstellungen für die Abfragen ---
+TIMEOUT_SEK = 10        # so lange auf eine Antwort warten, dann aufgeben
+ORS_TIMEOUT_SEK = 30    # openrouteservice rechnet alle Gemeinden auf einmal, das dauert länger
+ABFAHRT = "07:30"       # gleiche Abfahrtszeit für alle Gemeinden, damit man sie vergleichen kann
+ANZAHL_LIVE = 50        # so viele nahe Gemeinden fragen wir live ab (Fair Use der API)
+PAUSE_SEK = 0.2         # kurze Pause zwischen zwei Abfragen (Fair Use)
+MAX_FEHLER = 3          # so viele Fehler hintereinander: API gestört, wir hören auf
+KEINE_VERBINDUNG = -1   # API hat geantwortet, aber keine passende Verbindung gefunden
 
-# --- ÖV ---
-# Schätzung aus der Luftlinie: Minuten = PENDEL_A + PENDEL_B × km.
-# Absichtlich optimistisch (eine Untergrenze): Von 314 echten Zeiten (20.11.2026) lag fast
-# keine (unter 1 %) unter der Schätzung, im Schnitt waren sie 36 Min. länger. So fällt keine gute Gemeinde
-# beim Filter «max. Pendelzeit» weg, bevor app.py ihre echte Zeit abfragt (Task 2.8).
-# Eine Durchschnittsformel (24.3 + 1.61 × km) hätte z. B. Zug auf 64 statt 31 Min. geschätzt.
-# Herleitung: scripts/pendel_kalibrieren.py, Prüfung: scripts/schaetzung_pruefen.py
-PENDEL_A = 7.5    # Minuten fix: zur Haltestelle gehen, warten
-PENDEL_B = 0.76   # Minuten pro km Luftlinie
-# API hat geantwortet, aber keine Verbindung gefunden. Wird auch gecacht,
-# damit wir nicht jedes Mal erneut vergeblich fragen.
-KEINE_VERBINDUNG = -1
-# Zum Namen findet der Fahrplan manchmal einen anderen Ort ("Herdern" -> Zürich, Herdernstrasse).
-# 15 km, weil auch in den grössten Gemeinden das Dorf höchstens so weit vom Mittelpunkt liegt.
-MAX_ABSTAND_HALTESTELLE_KM = 15
-# Bahn-Betriebspunkte ohne Fahrgäste (Weichen, Abzweigungen), stehen bei swisstopo im Feld «detail»
-KEINE_HALTESTELLE = ("spurwechsel", "betriebspunkt", "anschlusspunkt", "abzweigung", "dienststation")
-# Fusswege: Der Fahrplan rechnet nur von Haltestelle zu Haltestelle (Umsteigezeiten sind
-# darin schon enthalten). Dazu kommen der Weg von zu Hause zur Haltestelle und von der
-# Ziel-Haltestelle zum Arbeitsort.
-ZUGANG_START_MIN = 5    # Annahme: von zu Hause zur Haltestelle (genaue Adresse kennen wir nicht)
-GEHTEMPO_KMH = 4.5
-UMWEG_FUSS = 1.3        # Fussweg ist länger als die Luftlinie
-MAX_FUSSWEG_MIN = 30    # weiter läuft niemand; dann stimmt die gefundene Haltestelle nicht
-# Cache-Version: ältere Einträge enthalten die Fusswege noch nicht und werden nicht verwendet
-CACHE_VERSION = "v2"
+# Bahn-Betriebspunkte (z. B. Weichen) sind keine Haltestellen. swisstopo schreibt
+# das ins Feld «detail»; solche Treffer überspringen wir.
+KEINE_HALTESTELLE = ["spurwechsel", "betriebspunkt", "anschlusspunkt", "abzweigung", "dienststation"]
 
-# --- Auto und Velo ---
-PROFIL_AUTO = "driving-car"
-PROFIL_VELO = "cycling-regular"
-VERKEHRSMITTEL = {PROFIL_AUTO: "auto", PROFIL_VELO: "velo"}   # Präfix der Spaltennamen
-# Schätzung, falls openrouteservice nicht antwortet: Median aus 2'084 Auto- und
-# 212 Velorouten nach Zürich HB (20.11.2026)
-UMWEG = {PROFIL_AUTO: 1.35, PROFIL_VELO: 1.35}   # Strassen-km pro km Luftlinie
-TEMPO_KMH = {PROFIL_AUTO: 76, PROFIL_VELO: 18}
-VELO_MAX_MIN = 45   # länger fährt kaum jemand täglich Velo
-VELO_MAX_KM = 25    # Luftlinie; weiter weg dauert es sowieso länger als VELO_MAX_MIN
+# Findet der Fahrplan zum Gemeindenamen einen Ort, der weiter als 15 km vom
+# Gemeinde-Mittelpunkt entfernt ist, war es der falsche Ort (z. B. eine gleichnamige Strasse).
+MAX_ABSTAND_KM = 15
 
-# --- Kosten ---
-MONATE = 12
-FAHRTEN_PRO_TAG = 2   # hin und zurück
+# --- Schätzung, wenn wir keine echte Zeit haben ---
+# ÖV-Minuten = PENDEL_A + PENDEL_B × km Luftlinie.
+# Die Werte hat das Team am 20.11.2026 aus echten ÖV-Verbindungen bestimmt (früheres
+# Skript scripts/pendel_kalibrieren.py). Die Formel gibt eher zu kurze Zeiten; darum
+# fragen wir die nahen Gemeinden live ab.
+PENDEL_A = 7.5     # Minuten fix: zur Haltestelle gehen, warten
+PENDEL_B = 0.76    # Minuten pro km Luftlinie
+# Strassen sind länger als die Luftlinie: Strassen-km = Luftlinie × 1.35
+UMWEG = 1.35
+# Durchschnittstempo für die Schätzung (km/h)
+TEMPO_KMH = {"auto": 76, "velo": 18}
+
+# --- openrouteservice ---
+ORS_PROFIL = {"auto": "driving-car", "velo": "cycling-regular"}
+VELO_MAX_KM = 25   # Velo nur für Gemeinden bis 25 km Luftlinie abfragen (weiter fährt kaum jemand)
 
 ERDRADIUS_KM = 6371
 
 
-@st.cache_data(ttl=GEOCODE_CACHE_SEK)   # app.py läuft bei jedem Klick neu
-def geocode(adresse: str) -> tuple[float, float, str] | None:
-    """Adresse -> (lat, lon, gefundener Name) über swisstopo, None wenn nichts gefunden."""
-    params = {"searchText": adresse, "type": "locations"}
+def geocode(adresse):
+    """
+    Sucht eine Adresse bei swisstopo.
+
+    Rückgabe: (lat, lon, gefundener Name) oder None, wenn nichts gefunden wurde.
+    """
+    params = {}
+    params["searchText"] = adresse
+    params["type"] = "locations"
     try:
         r = requests.get(SWISSTOPO_URL, params=params, timeout=TIMEOUT_SEK)
     except requests.exceptions.RequestException:   # z. B. kein Internet
         return None
-    if r.status_code != 200 or len(r.json()["results"]) == 0:
+    if r.status_code != 200:
+        return None
+    treffer = r.json()["results"]
+    if len(treffer) == 0:
         return None
 
-    # swisstopo liefert den besten Treffer zuerst. Bahn-Betriebspunkte (z. B. eine Weiche
-    # «Zürich HB SZU Süd (Spw)») sind aber keine Haltestellen: die überspringen wir.
-    treffer = r.json()["results"]
+    # swisstopo liefert den besten Treffer zuerst. Betriebspunkte überspringen wir.
     attrs = treffer[0]["attrs"]
     for resultat in treffer:
         detail = resultat["attrs"].get("detail", "")
-        if not any(wort in detail for wort in KEINE_HALTESTELLE):
+        ist_haltestelle = True
+        for wort in KEINE_HALTESTELLE:
+            if wort in detail:
+                ist_haltestelle = False
+        if ist_haltestelle:
             attrs = resultat["attrs"]
             break
-    # Label aufräumen: <i>…</i> enthält nur die Quelle oder ein Symbol (z. B. «train»)
-    name = re.sub(r"<i>.*?</i>", "", attrs["label"])
-    for tag in ["<b>", "</b>", "<i>", "</i>"]:
-        name = name.replace(tag, "")
+
+    # Der Name enthält HTML wie <b>Zürich</b> <i>train</i>: <i>…</i> ganz weg, <b> und </b> weg
+    name = attrs["label"]
+    while "<i>" in name and "</i>" in name:
+        start = name.index("<i>")
+        ende = name.index("</i>") + len("</i>")
+        name = name[:start] + name[ende:]
+    name = name.replace("<b>", "").replace("</b>", "")
     return (attrs["lat"], attrs["lon"], name.strip())
 
 
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Luftlinie in km (Haversine-Formel, https://de.wikipedia.org/wiki/Haversine-Formel)."""
-    # Auf der Erdkugel reicht Pythagoras nicht; math rechnet in Radiant statt Grad
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Luftlinie in km zwischen zwei Punkten (Haversine-Formel, de.wikipedia.org/wiki/Haversine-Formel)."""
+    # Die Erde ist eine Kugel, darum reicht Pythagoras nicht.
+    # math.sin und math.cos rechnen in Radiant, nicht in Grad.
     lat1 = math.radians(lat1)
     lon1 = math.radians(lon1)
     lat2 = math.radians(lat2)
@@ -124,7 +118,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * ERDRADIUS_KM * math.asin(math.sqrt(a))
 
 
-def dauer_in_minuten(dauer: str) -> int:
+def dauer_in_minuten(dauer):
     """Fahrzeit von transport.opendata.ch in Minuten, z. B. "00d01:12:00" -> 72."""
     tage = int(dauer[0:2])
     stunden = int(dauer[3:5])
@@ -132,387 +126,270 @@ def dauer_in_minuten(dauer: str) -> int:
     return tage * 24 * 60 + stunden * 60 + minuten
 
 
-def schaetze_minuten(km: float) -> float:
-    """Geschätzte ÖV-Pendelzeit in Minuten aus der Luftlinie (Untergrenze, siehe oben)."""
-    return PENDEL_A + PENDEL_B * km
-
-
-def naechster_montag() -> str:
-    """Datum des nächsten Montags, z. B. "2026-11-23"."""
+def naechster_montag():
+    """Datum des nächsten Montags als Text, z. B. "2026-11-30"."""
     heute = date.today()
     tage_bis_montag = 7 - heute.weekday()   # weekday(): Montag = 0, Sonntag = 6
     return (heute + timedelta(days=tage_bis_montag)).isoformat()
 
 
-def oev_ortsname(name: str) -> str:
-    """BFS-Name in Fahrplan-Schreibweise, z. B. "Kilchberg (ZH)" -> "Kilchberg ZH"."""
+def oev_ortsname(name):
+    """Gemeindename in Fahrplan-Schreibweise, z. B. "Kilchberg (ZH)" -> "Kilchberg ZH"."""
     return name.replace(" (", " ").replace(")", "")
 
 
-def live_minuten(start: str, ziel: str,
-                 pruef_lat: float | None = None, pruef_lon: float | None = None) -> int | None:
+def live_oev_minuten(gemeinde_name, gemeinde_lat, gemeinde_lon, ziel):
     """
-    ÖV-Fahrzeit in Minuten, Abfahrt nächster Montag um ABFAHRT.
+    Echte ÖV-Fahrzeit von einer Gemeinde zum Arbeitsort (nächster Montag, 07:30).
 
-    start, ziel: Ortsname oder "lat,lon". pruef_lat/pruef_lon: Gemeinde-Mittelpunkt;
-    liegt die gefundene Start-Haltestelle zu weit davon weg, gilt sie als falscher Ort.
-    Rückgabe: Minuten, KEINE_VERBINDUNG (dauerhaft) oder None (API gerade nicht erreichbar).
+    Parameter:
+        gemeinde_name: Name der Gemeinde, z. B. "Uster"
+        gemeinde_lat, gemeinde_lon: Mittelpunkt der Gemeinde (zur Kontrolle)
+        ziel: Arbeitsort als Text "lat,lon"
+
+    Rückgabe: Minuten der schnellsten Verbindung, KEINE_VERBINDUNG oder None (API nicht erreichbar)
     """
-    params = {"from": start, "to": ziel, "date": naechster_montag(), "time": ABFAHRT, "limit": 1}
-    ziel_lat, ziel_lon = (float(wert) for wert in ziel.split(","))
+    params = {}
+    params["from"] = oev_ortsname(gemeinde_name)
+    params["to"] = ziel
+    params["date"] = naechster_montag()
+    params["time"] = ABFAHRT
+    params["limit"] = 4   # vier Verbindungen, davon nehmen wir die schnellste
     try:
         r = requests.get(TRANSPORT_URL, params=params, timeout=TIMEOUT_SEK)
     except requests.exceptions.RequestException:
         return None
-    # 429 = zu viele Anfragen, 500er = Störung beim Server: später nochmals versuchen
+    # 429 = zu viele Anfragen, ab 500 = Störung beim Server
     if r.status_code == 429 or r.status_code >= 500:
         return None
-    if r.status_code != 200 or len(r.json()["connections"]) == 0:
+    if r.status_code != 200:
+        return KEINE_VERBINDUNG
+    verbindungen = r.json()["connections"]
+    if len(verbindungen) == 0:
         return KEINE_VERBINDUNG
 
-    verbindung = r.json()["connections"][0]
-    if pruef_lat is not None:
-        haltestelle = verbindung["from"]["station"]["coordinate"]   # x = lat, y = lon
-        if haltestelle["x"] is not None:
-            abstand = haversine_km(pruef_lat, pruef_lon, haltestelle["x"], haltestelle["y"])
-            if abstand > MAX_ABSTAND_HALTESTELLE_KM:
-                return KEINE_VERBINDUNG
-    return dauer_in_minuten(verbindung["duration"]) + ZUGANG_START_MIN + fussweg_minuten(verbindung, ziel_lat, ziel_lon)
+    # Kontrolle: Liegt die Start-Haltestelle wirklich in der Nähe der Gemeinde?
+    haltestelle = verbindungen[0]["from"]["station"]["coordinate"]   # x = lat, y = lon
+    if haltestelle["x"] is not None:
+        abstand = haversine_km(gemeinde_lat, gemeinde_lon, haltestelle["x"], haltestelle["y"])
+        if abstand > MAX_ABSTAND_KM:
+            return KEINE_VERBINDUNG
+
+    # Die schnellste der Verbindungen suchen
+    schnellste = None
+    for verbindung in verbindungen:
+        minuten = dauer_in_minuten(verbindung["duration"])
+        if schnellste is None or minuten < schnellste:
+            schnellste = minuten
+    return schnellste
 
 
-def fussweg_minuten(verbindung: dict, ziel_lat: float, ziel_lon: float) -> int:
-    """Gehzeit von der Ziel-Haltestelle zum Arbeitsort in Minuten."""
-    haltestelle = verbindung["to"]["station"]["coordinate"]   # x = lat, y = lon
-    if haltestelle["x"] is None:
-        return 0
-    km = haversine_km(haltestelle["x"], haltestelle["y"], ziel_lat, ziel_lon) * UMWEG_FUSS
-    return min(round(km / GEHTEMPO_KMH * 60), MAX_FUSSWEG_MIN)
-
-
-def commute_minutes(ziel_lat: float, ziel_lon: float,
-                    gemeinden: pd.DataFrame, max_abfragen: int = MAX_LIVE_ABFRAGEN,
-                    fortschritt=None, zusaetzlich: list[int] | None = None) -> pd.DataFrame:
+def oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt=None):
     """
     ÖV-Pendelzeit von jeder Gemeinde zum Arbeitsort.
 
-    Die nächsten Gemeinden und die aus «zusaetzlich» werden live abgefragt, alle
-    anderen aus der Luftlinie geschätzt. Antworten landen im Cache (pendel_cache).
+    Die ANZAHL_LIVE nächsten Gemeinden fragen wir live ab, alle anderen schätzen wir
+    aus der Luftlinie. Echte Zeiten kommen in den Cache, damit wir nicht zweimal fragen.
 
     Parameter:
         gemeinden:   DataFrame mit bfs_nr, name, lat, lon
-        fortschritt: optional ein Fortschrittsbalken aus app.py (st.progress)
-        zusaetzlich: optional bfs_nr, die ausser den nächsten live abgefragt werden (Task 2.8)
+        fortschritt: optional ein Fortschrittsbalken (st.progress) aus app.py
 
-    Rückgabe: DataFrame mit bfs_nr, pendel_min, pendel_geschaetzt
+    Rückgabe: DataFrame mit bfs_nr, km, pendel_min, geschaetzt
     """
     # Schritt 1: Luftlinie und Schätzung für alle Gemeinden (ohne Internet, sehr schnell)
-    km_liste = []
-    for index, zeile in gemeinden.iterrows():
-        km_liste.append(haversine_km(ziel_lat, ziel_lon, zeile["lat"], zeile["lon"]))
+    luftlinie = []
+    for lat, lon in zip(gemeinden["lat"], gemeinden["lon"]):
+        luftlinie.append(haversine_km(ziel_lat, ziel_lon, lat, lon))
     resultat = pd.DataFrame()
     resultat["bfs_nr"] = gemeinden["bfs_nr"]
-    resultat["km"] = km_liste
-    resultat["pendel_min"] = schaetze_minuten(resultat["km"]).round(0)
-    resultat["pendel_geschaetzt"] = True
+    resultat["name"] = gemeinden["name"]
+    resultat["lat"] = gemeinden["lat"]
+    resultat["lon"] = gemeinden["lon"]
+    resultat["luftlinie"] = luftlinie
+    resultat["km"] = (resultat["luftlinie"] * UMWEG).round(1)   # Strecken-km fürs Abo (Näherung)
+    resultat["pendel_min"] = (PENDEL_A + PENDEL_B * resultat["luftlinie"]).round()
+    resultat["geschaetzt"] = True
 
-    # Schritt 2: Welche Gemeinden live abfragen?
+    # Schritt 2: Bekannte Zeiten aus dem Cache lesen (als Dictionary bfs_nr -> minuten)
     ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
-    cache_ziel = f"{ziel}|{CACHE_VERSION}"
-    abfragen = resultat.sort_values("km").head(max_abfragen)
-    if zusaetzlich is not None:
-        extra = resultat[resultat["bfs_nr"].isin(zusaetzlich)]
-        abfragen = pd.concat([abfragen, extra]).drop_duplicates("bfs_nr")
-
-    # Schritt 3: Alles schon Bekannte auf einmal aus dem Cache laden, auch aus früheren
-    # Aufrufen (z. B. Runden in app.py). Live gefragt wird nur, was dort fehlt.
     con = get_cache_connection()
-    cache = pd.read_sql("SELECT bfs_nr, minuten FROM pendel_cache WHERE ziel = ?",
-                        con, params=(cache_ziel,))
-    bekannt = dict(zip(cache["bfs_nr"], cache["minuten"]))   # bfs_nr -> minuten
+    cache = pd.read_sql("SELECT bfs_nr, minuten FROM oev_zeiten WHERE ziel = ?", con, params=(ziel,))
+    bekannt = {}
+    for bfs_nr, minuten in zip(cache["bfs_nr"], cache["minuten"]):
+        bekannt[bfs_nr] = minuten
 
-    fehler_in_folge = 0
+    # Schritt 3: Die nächsten Gemeinden live abfragen, wenn sie noch nicht im Cache sind
+    naechste = resultat.sort_values("luftlinie").head(ANZAHL_LIVE)
+    fehler_hintereinander = 0
     erledigt = 0
-    for index, zeile in abfragen.iterrows():
-        if fehler_in_folge >= MAX_FEHLER_IN_FOLGE:   # Notbremse, API wohl gestört
+    for bfs_nr, name, lat, lon in zip(naechste["bfs_nr"], naechste["name"], naechste["lat"], naechste["lon"]):
+        if fehler_hintereinander >= MAX_FEHLER:   # API gestört: Rest bleibt geschätzt
             break
-        bfs_nr = int(zeile["bfs_nr"])
         if bfs_nr not in bekannt:
-            gemeinde = gemeinden.loc[index]
-            # Mit dem Namen findet der Fahrplan die Haltestelle im Dorf. Der Flächen-
-            # mittelpunkt liegt bei grossen Gemeinden oft am Berg, weit weg davon.
-            minuten = live_minuten(oev_ortsname(gemeinde["name"]), ziel,
-                                   gemeinde["lat"], gemeinde["lon"])
-            if minuten == KEINE_VERBINDUNG:   # Notlösung: ab dem Mittelpunkt
-                minuten = live_minuten(f"{gemeinde['lat']:.4f},{gemeinde['lon']:.4f}", ziel)
-
+            minuten = live_oev_minuten(name, lat, lon, ziel)
             if minuten is None:
-                fehler_in_folge += 1
+                fehler_hintereinander = fehler_hintereinander + 1
             else:
-                fehler_in_folge = 0
+                fehler_hintereinander = 0
                 bekannt[bfs_nr] = minuten
                 with con:
-                    con.execute(
-                        "INSERT OR REPLACE INTO pendel_cache (bfs_nr, ziel, minuten) VALUES (?, ?, ?)",
-                        (bfs_nr, cache_ziel, minuten),
-                    )
+                    con.execute("INSERT INTO oev_zeiten (bfs_nr, ziel, minuten) VALUES (?, ?, ?)",
+                                (int(bfs_nr), ziel, minuten))
             time.sleep(PAUSE_SEK)
-
-        erledigt += 1
+        erledigt = erledigt + 1
         if fortschritt is not None:
-            fortschritt.progress(erledigt / len(abfragen))
+            fortschritt.progress(erledigt / len(naechste))
     con.close()
 
-    # Schritt 4: Schätzungen durch alle bekannten echten Zeiten ersetzen
-    for index, zeile in resultat.iterrows():
-        minuten = bekannt.get(int(zeile["bfs_nr"]))
-        if minuten is not None and minuten != KEINE_VERBINDUNG:
-            resultat.loc[index, "pendel_min"] = minuten
-            resultat.loc[index, "pendel_geschaetzt"] = False
+    # Schritt 4: Schätzungen durch echte Zeiten ersetzen
+    for index in resultat.index:
+        bfs_nr = resultat.loc[index, "bfs_nr"]
+        if bfs_nr in bekannt and bekannt[bfs_nr] != KEINE_VERBINDUNG:
+            resultat.loc[index, "pendel_min"] = bekannt[bfs_nr]
+            resultat.loc[index, "geschaetzt"] = False
 
-    return resultat[["bfs_nr", "pendel_min", "pendel_geschaetzt"]]
+    return resultat[["bfs_nr", "km", "pendel_min", "geschaetzt"]]
 
 
-def ors_schluessel() -> str | None:
-    """API-Schlüssel für openrouteservice aus den Streamlit-Secrets, sonst None."""
+def ors_schluessel():
+    """Schlüssel für openrouteservice aus den Streamlit-Secrets, sonst None."""
     try:
         return st.secrets["ORS_KEY"]
-    except (KeyError, FileNotFoundError):   # secrets.toml oder Eintrag fehlt
+    except (KeyError, FileNotFoundError):   # secrets.toml oder der Eintrag fehlt
         return None
 
 
-def ors_abfrage(ziel_lat: float, ziel_lon: float,
-                kandidaten: pd.DataFrame, profil: str) -> pd.DataFrame | None:
-    """Eine Matrix-Anfrage an openrouteservice: bfs_nr, minuten, km oder None bei Fehler."""
+def ors_abfrage(ziel_lat, ziel_lon, kandidaten, verkehrsmittel):
+    """
+    Eine Anfrage an openrouteservice: Fahrzeit und Strassen-km von allen Kandidaten zum Arbeitsort.
+
+    Rückgabe: DataFrame mit bfs_nr, minuten, km oder None bei einem Fehler
+    """
     schluessel = ors_schluessel()
     if schluessel is None:
         return None
 
-    # openrouteservice will [lon, lat], also umgekehrt als swisstopo.
-    # Ort 0 ist der Arbeitsort, danach kommen die Gemeinden.
+    # Liste aller Orte. openrouteservice will [lon, lat], also umgekehrt als swisstopo.
+    # Ort Nummer 0 ist der Arbeitsort, danach kommen die Gemeinden (Nummer 1, 2, 3 ...).
     orte = [[ziel_lon, ziel_lat]]
-    for index, zeile in kandidaten.iterrows():
-        orte.append([zeile["lon"], zeile["lat"]])
-    anfrage = {
-        "locations": orte,
-        "sources": list(range(1, len(orte))),   # alle Gemeinden
-        "destinations": [0],                     # nur der Arbeitsort
-        "metrics": ["duration", "distance"],
-        "units": "km",
-    }
+    for lat, lon in zip(kandidaten["lat"], kandidaten["lon"]):
+        orte.append([lon, lat])
+
+    # Was wir wissen wollen, als Dictionary (wird als JSON geschickt)
+    anfrage = {}
+    anfrage["locations"] = orte
+    anfrage["sources"] = list(range(1, len(orte)))   # Start: alle Gemeinden
+    anfrage["destinations"] = [0]                    # Ziel: nur der Arbeitsort
+    anfrage["metrics"] = ["duration", "distance"]    # Zeit und Distanz
+    anfrage["units"] = "km"
+
+    # POST statt GET, weil die Liste der Orte zu lang für die Adresszeile ist.
+    # Der Schlüssel kommt in den Header (wie beim Yelp-Beispiel in Übung 7).
+    headers = {"Authorization": schluessel}
     try:
-        r = requests.post(ORS_URL + profil, json=anfrage,
-                          headers={"Authorization": schluessel}, timeout=ORS_TIMEOUT_SEK)
+        r = requests.post(ORS_URL + ORS_PROFIL[verkehrsmittel], json=anfrage,
+                          headers=headers, timeout=ORS_TIMEOUT_SEK)
     except requests.exceptions.RequestException:
         return None
     if r.status_code != 200:
         return None
 
-    daten = r.json()   # pro Gemeinde eine Liste mit genau einem Wert (ein Ziel)
+    # Antwort: pro Gemeinde eine Liste mit genau einem Wert (wir haben nur ein Ziel)
+    daten = r.json()
     zeilen = []
     for bfs_nr, dauer, distanz in zip(kandidaten["bfs_nr"], daten["durations"], daten["distances"]):
-        if dauer[0] is None:   # keine Route gefunden, z. B. autofreie Gemeinde
-            continue
-        zeilen.append({"bfs_nr": int(bfs_nr), "minuten": dauer[0] / 60, "km": distanz[0]})
+        if dauer[0] is not None:   # None = keine Route gefunden, z. B. autofreie Gemeinde
+            zeilen.append({"bfs_nr": int(bfs_nr), "minuten": dauer[0] / 60, "km": distanz[0]})
     if len(zeilen) == 0:
         return None
     return pd.DataFrame(zeilen)
 
 
-def route_matrix(ziel_lat: float, ziel_lon: float,
-                 gemeinden: pd.DataFrame, profil: str) -> pd.DataFrame:
+def route_zeiten(ziel_lat, ziel_lon, gemeinden, verkehrsmittel):
     """
     Fahrzeit und Strassen-km mit Auto oder Velo von jeder Gemeinde zum Arbeitsort.
 
     Parameter:
-        gemeinden: DataFrame mit bfs_nr, lat, lon
-        profil:    PROFIL_AUTO oder PROFIL_VELO
+        gemeinden:      DataFrame mit bfs_nr, lat, lon
+        verkehrsmittel: "auto" oder "velo"
 
-    Rückgabe: DataFrame mit bfs_nr, <vm>_km, <vm>_min, <vm>_geschaetzt (<vm> = auto oder velo)
+    Rückgabe: DataFrame mit bfs_nr, km, pendel_min, geschaetzt
     """
-    vm = VERKEHRSMITTEL[profil]
-    ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
-
     # Schritt 1: Schätzung aus der Luftlinie für alle Gemeinden
-    kandidaten = gemeinden[["bfs_nr", "lat", "lon"]].copy()   # copy: wir fügen eine Spalte an
-    km_liste = []
-    for index, zeile in kandidaten.iterrows():
-        km_liste.append(haversine_km(ziel_lat, ziel_lon, zeile["lat"], zeile["lon"]))
-    kandidaten["luftlinie"] = km_liste
-
+    luftlinie = []
+    for lat, lon in zip(gemeinden["lat"], gemeinden["lon"]):
+        luftlinie.append(haversine_km(ziel_lat, ziel_lon, lat, lon))
     resultat = pd.DataFrame()
-    resultat["bfs_nr"] = kandidaten["bfs_nr"]
-    resultat[f"{vm}_km"] = (kandidaten["luftlinie"] * UMWEG[profil]).round(1)
-    resultat[f"{vm}_min"] = (resultat[f"{vm}_km"] / TEMPO_KMH[profil] * 60).round(0)
-    resultat[f"{vm}_geschaetzt"] = True
-    resultat = resultat.set_index("bfs_nr")
+    resultat["bfs_nr"] = gemeinden["bfs_nr"]
+    resultat["lat"] = gemeinden["lat"]
+    resultat["lon"] = gemeinden["lon"]
+    resultat["luftlinie"] = luftlinie
+    resultat["km"] = (resultat["luftlinie"] * UMWEG).round(1)
+    resultat["pendel_min"] = (resultat["km"] / TEMPO_KMH[verkehrsmittel] * 60).round()
+    resultat["geschaetzt"] = True
 
-    # Schritt 2: echte Werte aus dem Cache, sonst einmal bei openrouteservice holen
+    # Schritt 2: Echte Werte aus dem Cache. Fehlen sie, einmal bei openrouteservice holen.
+    ziel = f"{ziel_lat:.4f},{ziel_lon:.4f}"
     con = get_cache_connection()
     echte = pd.read_sql("SELECT bfs_nr, minuten, km FROM route_cache WHERE ziel = ? AND profil = ?",
-                        con, params=(ziel, profil))
+                        con, params=(ziel, verkehrsmittel))
     if len(echte) == 0:
-        if profil == PROFIL_VELO:
-            kandidaten = kandidaten[kandidaten["luftlinie"] <= VELO_MAX_KM]
-        echte = ors_abfrage(ziel_lat, ziel_lon, kandidaten, profil)
+        kandidaten = resultat
+        if verkehrsmittel == "velo":
+            kandidaten = resultat[resultat["luftlinie"] <= VELO_MAX_KM]
+        echte = ors_abfrage(ziel_lat, ziel_lon, kandidaten, verkehrsmittel)
         if echte is not None:
-            speichern = echte.copy()   # copy: ziel und profil braucht nur der Cache
-            speichern["ziel"] = ziel
-            speichern["profil"] = profil
-            with con:
-                speichern.to_sql("route_cache", con, if_exists="append", index=False)
+            for bfs_nr, minuten, km in zip(echte["bfs_nr"], echte["minuten"], echte["km"]):
+                with con:
+                    con.execute("INSERT INTO route_cache (bfs_nr, ziel, profil, minuten, km) "
+                                "VALUES (?, ?, ?, ?, ?)", (bfs_nr, ziel, verkehrsmittel, minuten, km))
     con.close()
 
     # Schritt 3: Schätzungen durch die echten Werte ersetzen
     if echte is not None:
-        for index, zeile in echte.iterrows():
-            bfs_nr = int(zeile["bfs_nr"])
-            resultat.loc[bfs_nr, f"{vm}_min"] = round(zeile["minuten"])
-            resultat.loc[bfs_nr, f"{vm}_km"] = round(zeile["km"], 1)
-            resultat.loc[bfs_nr, f"{vm}_geschaetzt"] = False
-    return resultat.reset_index()
+        resultat = resultat.set_index("bfs_nr")
+        for bfs_nr, minuten, km in zip(echte["bfs_nr"], echte["minuten"], echte["km"]):
+            resultat.loc[bfs_nr, "pendel_min"] = round(minuten)
+            resultat.loc[bfs_nr, "km"] = round(km, 1)
+            resultat.loc[bfs_nr, "geschaetzt"] = False
+        resultat = resultat.reset_index()
+
+    return resultat[["bfs_nr", "km", "pendel_min", "geschaetzt"]]
 
 
-def bestes_verkehrsmittel(optionen: dict, max_min: float, zeitwert: float | None,
-                          lieblings_vm: str | None = None, toleranz_min: float = 0) -> str | None:
+def pendeln_berechnen(ziel_lat, ziel_lon, gemeinden, verkehrsmittel, buerotage, hat_auto, fortschritt=None):
     """
-    Bestes Verkehrsmittel aus {"oev": (minuten, chf), ...}.
-
-    Ohne Zeitwert das günstigste, sonst das mit den tiefsten Kosten + Zeitwert × Minuten;
-    nur bis max_min. Ist keins schnell genug, das schnellste. Hat die Nutzerin ein
-    Lieblings-Verkehrsmittel, gewinnt es, solange es höchstens toleranz_min länger dauert.
-    """
-    bestes = None
-    beste_punkte = None
-    for vm in optionen:
-        minuten, chf = optionen[vm]
-        if minuten > max_min:
-            continue
-        if zeitwert is None:
-            punkte = chf
-        else:
-            punkte = chf + zeitwert * minuten
-        if beste_punkte is None or punkte < beste_punkte:
-            bestes = vm
-            beste_punkte = punkte
-
-    # Keins schnell genug: app.py filtert die Gemeinde über die max. Pendelzeit ohnehin weg
-    if bestes is None:
-        for vm in optionen:
-            if bestes is None or optionen[vm][0] < optionen[bestes][0]:
-                bestes = vm
-        return bestes
-
-    # Vorliebe der Nutzerin (direkte Eingabe in app.py, nicht Teil des ML-Modells)
-    if lieblings_vm in optionen and lieblings_vm != bestes:
-        lieblings_min = optionen[lieblings_vm][0]
-        if lieblings_min <= max_min and lieblings_min <= optionen[bestes][0] + toleranz_min:
-            bestes = lieblings_vm
-    return bestes
-
-
-def pendel_optionen(gemeinden: pd.DataFrame, pendel: pd.DataFrame,
-                    routen: pd.DataFrame, eingaben: dict) -> pd.DataFrame:
-    """
-    Zeit und Kosten pro Jahr für ÖV, Auto und Velo sowie das beste Verkehrsmittel.
+    Pendelzeit und Pendelkosten pro Jahr für alle Gemeinden mit einem Verkehrsmittel.
 
     Parameter:
-        pendel:   Ergebnis von commute_minutes() (ÖV)
-        routen:   route_matrix() für Auto und Velo, verknüpft über bfs_nr
-        eingaben: {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5,
-                   "hat_auto": False, "parkplatz_chf": 0, "oev_abo": "guenstigstes",
-                   "lieblings_vm": None, "toleranz_min": 0, "max_pendel_min": 45, "zeitwert": None}
-                  oev_abo: Schlüssel aus data.OEV_ABOS
-                  zeitwert = CHF pro Jahr für 1 Minute pro Weg (von AP 3), None = noch keiner
+        verkehrsmittel: "oev", "auto" oder "velo"
+        buerotage:      Tage pro Woche im Büro (für die Autokosten)
+        hat_auto:       True = Auto ist schon vorhanden
 
-    Rückgabe: DataFrame mit bfs_nr, oev_geschaetzt, oev/auto/velo_min und _chf,
-              bestes_vm, pendel_min, pendel_chf (nicht gewählte Verkehrsmittel leer)
+    Rückgabe: DataFrame mit bfs_nr, km, pendel_min, geschaetzt, pendel_chf
     """
-    df = gemeinden[["bfs_nr"]].merge(pendel, on="bfs_nr").merge(routen, on="bfs_nr")
-    df = df.rename(columns={"pendel_min": "oev_min", "pendel_geschaetzt": "oev_geschaetzt"})
-
-    gewaehlt = eingaben["verkehrsmittel"]
-    if eingaben["hat_auto"]:
-        auto_chf_pro_km = AUTO_CHF_PRO_KM_VARIABEL
+    if verkehrsmittel == "oev":
+        pendel = oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt)
     else:
-        auto_chf_pro_km = AUTO_CHF_PRO_KM_TOTAL
-    fahrten_pro_jahr = FAHRTEN_PRO_TAG * eingaben["buerotage"] * ARBEITSWOCHEN
+        pendel = route_zeiten(ziel_lat, ziel_lon, gemeinden, verkehrsmittel)
 
-    zeilen = []
-    for index, g in df.iterrows():
-        zeile = {"bfs_nr": g["bfs_nr"], "oev_geschaetzt": g["oev_geschaetzt"]}
-        optionen = {}
-        if "oev" in gewaehlt:
-            # Tarif-km des Abos: Strassen-km als Näherung, die Bahn ist ähnlich lang
-            oev_chf = oev_abopreis(g["auto_km"], eingaben.get("oev_abo", "guenstigstes"))
-            optionen["oev"] = (g["oev_min"], oev_chf)
-        if "auto" in gewaehlt:
-            auto_chf = g["auto_km"] * fahrten_pro_jahr * auto_chf_pro_km + MONATE * eingaben["parkplatz_chf"]
-            optionen["auto"] = (g["auto_min"], round(auto_chf))
-        if "velo" in gewaehlt and g["velo_min"] <= VELO_MAX_MIN:
-            optionen["velo"] = (g["velo_min"], 0)
-
-        for vm in ["oev", "auto", "velo"]:
-            if vm in optionen:
-                zeile[f"{vm}_min"] = optionen[vm][0]
-                zeile[f"{vm}_chf"] = optionen[vm][1]
-            else:
-                zeile[f"{vm}_min"] = None
-                zeile[f"{vm}_chf"] = None
-
-        bestes = bestes_verkehrsmittel(optionen, eingaben["max_pendel_min"], eingaben["zeitwert"],
-                                       eingaben.get("lieblings_vm"), eingaben.get("toleranz_min", 0))
-        zeile["bestes_vm"] = bestes
-        if bestes is None:   # gar kein Verkehrsmittel gewählt
-            zeile["pendel_min"] = None
-            zeile["pendel_chf"] = None
+    # Kosten pro Jahr für jede Gemeinde
+    kosten = []
+    for km in pendel["km"]:
+        if verkehrsmittel == "oev":
+            kosten.append(oev_kosten(km))
+        elif verkehrsmittel == "auto":
+            kosten.append(auto_kosten(km, buerotage, hat_auto))
         else:
-            zeile["pendel_min"] = optionen[bestes][0]
-            zeile["pendel_chf"] = optionen[bestes][1]
-        zeilen.append(zeile)
-    return pd.DataFrame(zeilen)
+            kosten.append(0)   # Velo fahren kostet (fast) nichts
+    pendel["pendel_chf"] = kosten
+    return pendel
 
 
-# --- Test: läuft nur bei "python api.py", nicht wenn app.py die Datei importiert ---
+# --- Kurzer Test: läuft nur bei "python api.py", nicht wenn app.py die Datei importiert ---
 if __name__ == "__main__":
-    from data import fake_municipalities, get_municipalities
-
     for adresse in ["Bahnhofstrasse 1, Zürich", "Zürich HB", "Wetzikon", "asdfghjkl"]:
         print(adresse, "->", geocode(adresse))   # Unsinn soll None geben, nicht abstürzen
     print("Zürich-Bern km (ca. 95):", round(haversine_km(47.378, 8.540, 46.949, 7.439), 1))
-
-    # ÖV mit Fake-Gemeinden: 2. Aufruf soll dank Cache sofort fertig sein
-    for aufruf in [1, 2]:
-        startzeit = time.time()
-        df = commute_minutes(47.378, 8.540, fake_municipalities())
-        print(f"ÖV {aufruf}. Aufruf: {time.time() - startzeit:.1f} Sek.,",
-              (df["pendel_geschaetzt"] == False).sum(), "echte Zeiten")
-    # Die Fake-Gemeinden haben BFS-Nummern 1–30, die es auch echt gibt: Testeinträge löschen
-    con = get_cache_connection()
-    with con:
-        con.execute("DELETE FROM pendel_cache WHERE ziel = ?", ("47.3780,8.5400",))
-    con.close()
-
-    # Auto und Velo mit echten Gemeinden, Arbeitsort Zürich HB
-    alle = get_municipalities()
-    print("openrouteservice-Schlüssel gefunden:", ors_schluessel() is not None)
-    for profil in [PROFIL_AUTO, PROFIL_VELO]:
-        vm = VERKEHRSMITTEL[profil]
-        startzeit = time.time()
-        routen = route_matrix(47.378, 8.540, alle, profil)
-        print(f"{vm}: {time.time() - startzeit:.1f} Sek.,",
-              (routen[f"{vm}_geschaetzt"] == False).sum(), "echte Werte")
-
-    # Pendelkosten (Task 2.7): drei von Hand nachgerechnete Fälle Rapperswil-Jona -> Zürich HB
-    pendel = commute_minutes(47.378, 8.540, alle)
-    routen = route_matrix(47.378, 8.540, alle, PROFIL_AUTO).merge(
-        route_matrix(47.378, 8.540, alle, PROFIL_VELO), on="bfs_nr")
-    rj = alle[alle["name"] == "Rapperswil-Jona"]["bfs_nr"].iloc[0]
-    eingaben = {"verkehrsmittel": ["oev", "auto", "velo"], "buerotage": 5, "hat_auto": False,
-                "parkplatz_chf": 0, "oev_abo": "guenstigstes", "max_pendel_min": 60, "zeitwert": None}
-    erwartet = [({}, 14603), ({"hat_auto": True}, 5526), ({"hat_auto": True, "parkplatz_chf": 200}, 7926)]
-    for aenderung, auto_chf in erwartet:
-        e = eingaben.copy()   # copy: die Grundeingaben sollen für den nächsten Fall gleich bleiben
-        e.update(aenderung)
-        zeile = pendel_optionen(alle, pendel, routen, e).set_index("bfs_nr").loc[rj]
-        print(f"Rapperswil-Jona {aenderung}: Auto {zeile['auto_chf']} CHF (erwartet {auto_chf}),",
-              f"ÖV {zeile['oev_chf']} CHF (erwartet 2349)")
+    print("00d01:12:00 ->", dauer_in_minuten("00d01:12:00"), "Minuten (erwartet 72)")

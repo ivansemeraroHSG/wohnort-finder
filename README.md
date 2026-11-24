@@ -4,9 +4,9 @@ Gruppenprojekt im Kurs *Fundamentals and Methods of Computer Science*, HSG, HS 2
 
 ## Problem
 
-Wer einen Job in Zürich hat, fragt sich: Lohnt es sich, nach Zug oder Schwyz zu ziehen? Tiefe Steuern heissen nicht automatisch günstig wohnen, denn in Steuerparadiesen sind die Mieten oft hoch. Ob sich ein Umzug lohnt, hängt vom eigenen Einkommen und Haushalt ab und lässt sich nicht im Kopf ausrechnen: Für eine ledige Person mit 60'000 CHF ist Zug rund 3'000 CHF pro Jahr teurer als Rapperswil-Jona, bei 300'000 CHF ist Zug über 8'000 CHF günstiger.
+Wer einen Job in Zürich hat, fragt sich: Lohnt es sich, nach Zug oder Schwyz zu ziehen? Tiefe Steuern heissen nicht automatisch günstig wohnen, denn in Steuerparadiesen sind die Mieten oft hoch. Ob sich ein Umzug lohnt, hängt vom eigenen Einkommen, Haushalt und Arbeitsweg ab und lässt sich nicht im Kopf ausrechnen.
 
-Der Wohnort-Finder rechnet für die eigene Situation die **Wohnkosten pro Jahr** (Steuern + 12 × Miete) aller 2110 Gemeinden aus, vergleicht sie mit dem heutigen Wohnort und zeigt, wie viel man spart und wie viel länger man dafür pendelt. Aus Bewertungen lernt die App, wie viel einem eine Minute Pendelzeit wert ist.
+Der Wohnort-Finder rechnet für die eigene Situation die **Gesamtkosten pro Jahr** (Steuern + 12 × Miete + Pendeln) aller 2'110 Gemeinden aus und vergleicht sie mit dem heutigen Wohnort. Aus den Bewertungen der Nutzerin lernt ein Machine-Learning-Modell, welche Gemeinden zu ihr passen.
 
 ## Online-Version
 
@@ -18,59 +18,67 @@ _Link zu Streamlit Community Cloud folgt._
 python -m venv ~/venvs/wohnort
 source ~/venvs/wohnort/bin/activate      # Windows: %USERPROFILE%\venvs\wohnort\Scripts\activate
 pip install -r requirements.txt
-python scripts/grenzen_aufbereiten.py    # Gemeindegrenzen auf Stand 2026
-python scripts/build_db.py               # baut data/wohnort.db
 streamlit run app.py
 ```
+
+Die Datenbank `data/wohnort.db` liegt schon im Projekt. Nur wer sie aus den Rohdaten neu bauen will:
+
+```
+python scripts/grenzen_aufbereiten.py    # Gemeindegrenzen auf Stand 2026
+python scripts/build_db.py               # baut data/wohnort.db
+```
+
+Für Auto und Velo braucht die App einen Schlüssel von openrouteservice in `.streamlit/secrets.toml` (`ORS_KEY = "..."`). Ohne Schlüssel schätzt sie die Zeiten aus der Luftlinie.
 
 ## Aufbau
 
 | Datei | Inhalt |
 | --- | --- |
-| `app.py` | Streamlit-Oberfläche |
-| `scoring.py` | Wohnkosten pro Gemeinde (Grundlage des Rankings) |
-| `data.py` | Zugriff auf die SQLite-Datenbank |
-| `api.py` | swisstopo und transport.opendata.ch |
-| `model.py` | k-means, logistische Regression (Wert der Pendelzeit) |
-| `charts.py` | Karte, Scatterplot, Tabellen |
-| `scripts/steuern_laden.py` | lädt die Steuerdaten einmalig von der ESTV |
+| `app.py` | Streamlit-Oberfläche: Eingaben, Bewerten, Ergebnis |
+| `data.py` | Zugriff auf die SQLite-Datenbank, feste Kostenwerte |
+| `api.py` | swisstopo, transport.opendata.ch und openrouteservice; Pendelzeit und Pendelkosten |
+| `model.py` | k-means (Auswahl zum Bewerten) und logistische Regression (was passt zu mir?) |
+| `charts.py` | Grafiken mit matplotlib |
+| `scoring.py` | Gesamtkosten pro Gemeinde |
 | `scripts/grenzen_aufbereiten.py` | passt die Gemeindegrenzen an die Gemeinden 2026 an |
 | `scripts/build_db.py` | baut die Datenbank aus `data/raw/` |
-| `scripts/pendel_kalibrieren.py` | bestimmt die Formel für geschätzte Pendelzeiten |
+| `scripts/steuern_laden.py` | hat die Steuerdaten einmalig von der ESTV geladen |
 
 ## Datenquellen
 
-Alle Daten sind öffentlich und kostenlos. Die Originaldateien liegen unverändert in `data/raw/`, bereinigt wird nur in `scripts/build_db.py`. Details zu jeder Datei: `data/raw/QUELLEN.md`.
+Alle Daten sind öffentlich und kostenlos. Die Originaldateien liegen unverändert in `data/raw/`. Details zu jeder Datei und zu den Kostenansätzen: `data/raw/QUELLEN.md`.
 
-| Daten | Quelle | Link | Stand | Verwendung |
-| --- | --- | --- | --- | --- |
-| Gemeindeliste mit Kanton und Gemeindetyp | BFS, Amtliches Gemeindeverzeichnis (REST-API) | https://www.agvchapp.bfs.admin.ch/api/communes/levels?date=01-01-2026 | 01.01.2026 | Liste der 2110 Gemeinden |
-| Einkommenssteuer (Bund, Kanton, Gemeinde) | ESTV Steuerrechner, Schnittstelle der Webseite | https://swisstaxcalculator.estv.admin.ch | Steuerjahr 2026 | Steuern pro Gemeinde, 3 Haushaltstypen, 6 Einkommen |
-| Durchschnittliche Miete nach Kanton (T 09.03.03.01) | BFS, Strukturerhebung | https://statistik.admin.ch/de/asset/36398431 | Daten 2024 | Basis der Mietschätzung |
-| Durchschnittliche Miete nach Gemeindetyp (T 09.03.03.16) | BFS, Strukturerhebung | https://statistik.admin.ch/de/asset/36398494 | Daten 2024 | Basis der Mietschätzung |
-| Generalisierte Gemeindegrenzen (K4) | BFS | https://statistik.admin.ch/en/asset/34367751 | 01.01.2025, angepasst auf 2026 | Karte, Koordinaten der Gemeinden |
-| Adresssuche (Arbeitsort) | swisstopo SearchServer, live | https://api3.geo.admin.ch/rest/services/api/SearchServer | laufend | Koordinaten des Arbeitsorts |
-| ÖV-Verbindungen | transport.opendata.ch, live | https://transport.opendata.ch/v1/connections | laufend | Pendelzeit zu den nächsten Gemeinden |
-| Preise Strecken-Abo (Tarif T650) | Alliance SwissPass | https://www.allianceswisspass.ch/de/tarife-vorschriften/uebersicht | Ausgabe 01.06.2026 | ÖV-Kosten pro Jahr (`data.oev_abopreis`) |
-| Preis GA 2. Klasse (4'095 CHF) | Alliance SwissPass / SBB, Medienmitteilung Preisüberwacher 04.08.2026 | https://www.sbb.ch/de/billette-angebote/abos/ga/ga-preise.html | ab Dezember 2026 | Obergrenze der ÖV-Kosten |
-| Kilometerkosten Auto (74 Rp./km, davon variabel 4'135 CHF pro 15'000 km) | TCS | https://www.tcs.ch/de/der-tcs/presse/medienmitteilungen-2026/kilometerkosten-2026.php | 2026 | Autokosten pro Jahr |
-| Fahrzeit und Strassendistanz Auto und Velo | openrouteservice (Matrix-API), live | https://openrouteservice.org | laufend | Auto- und Veloweg, Tarifkilometer (Task 2.6) |
+| Daten | Quelle | Verwendung |
+| --- | --- | --- |
+| Gemeindeliste mit Kanton und Gemeindetyp | BFS, Amtliches Gemeindeverzeichnis, Stand 01.01.2026 | Liste der 2'110 Gemeinden |
+| Einkommenssteuer (Bund, Kanton, Gemeinde) | ESTV Steuerrechner, Steuerjahr 2026 | Steuern pro Gemeinde, 3 Haushaltstypen, 6 Einkommen |
+| Durchschnittliche Miete nach Kanton und nach Gemeindetyp | BFS, Strukturerhebung, Daten 2024 | Schätzung der Miete pro Gemeinde |
+| Generalisierte Gemeindegrenzen | BFS, Stand 01.01.2025, angepasst auf 2026 | Koordinaten der Gemeinden |
+| Adresssuche | swisstopo SearchServer (live) | Koordinaten des Arbeitsorts |
+| ÖV-Verbindungen | transport.opendata.ch (live) | ÖV-Zeit für die 50 nächsten Gemeinden |
+| Fahrzeit Auto und Velo | openrouteservice, Matrix-API (live) | Auto- und Velozeit, Strassen-km |
+| Preise Strecken-Abo und GA | Alliance SwissPass, Tarif T650 (01.06.2026) | ÖV-Kosten pro Jahr |
+| Kilometerkosten Auto | TCS 2026 | Autokosten pro Jahr |
 
-**Wie wir die Daten aufbereiten**
+**Wie wir rechnen**
 
-- **Steuern:** Die ESTV bietet keine offizielle API. Wir haben die Schnittstelle des Steuerrechners einmalig mit `scripts/steuern_laden.py` abgefragt (ohne Kirchensteuer, nur Einkommenssteuer). Für Einkommen zwischen den Stufen interpoliert `data.get_tax()` linear.
-- **Mieten:** Das BFS veröffentlicht Mieten nicht pro Gemeinde. Wir schätzen sie: Kantonsmiete × (Miete des Gemeindetyps / Miete Schweiz). Alle Mieten sind darum als geschätzt markiert. Es sind Durchschnitte bestehender Mietverhältnisse (netto), nicht aktuelle Angebotsmieten.
-- **Gemeindegrenzen:** Die Grenzen haben Stand 2025. 14 Gemeinden haben bis 2026 fusioniert oder (Moutier) den Kanton gewechselt; `scripts/grenzen_aufbereiten.py` ordnet ihre Flächen den Gemeinden 2026 zu.
-- **Pendelzeit:** Für die 50 nächsten Gemeinden live abgefragt (Montag 07:30), für alle anderen aus der Luftlinie geschätzt.
-- **Pendelkosten:** ÖV = Jahres-Strecken-Abo nach Tarif T650 (Monatspreis × 9, Grundpreis 17.22 CHF pro km mit Rabatt je nach Distanz), höchstens der GA-Preis. Der Tarif rechnet mit Bahnkilometern; wir verwenden dafür die Strassendistanz. In Agglomerationen kann ein Verbund-Abo (z. B. ZVV) etwas günstiger sein. Auto = gefahrene km × 28 Rp. (Auto schon vorhanden, nur variable Kosten) bzw. 74 Rp. (TCS, inkl. Fixkosten), plus Parkplatz. 46 Arbeitswochen pro Jahr.
+- **Steuern:** In der Datenbank stehen 6 Einkommensstufen. Für ein Einkommen dazwischen rechnet `data.get_tax()` mit einem Dreisatz.
+- **Mieten:** Das BFS veröffentlicht keine Mieten pro Gemeinde. Wir schätzen: Kantonsmiete × (Miete des Gemeindetyps / Miete Schweiz).
+- **Pendelzeit:** ÖV für die 50 nächsten Gemeinden live aus dem Fahrplan (Montag 07:30), für alle anderen aus der Luftlinie geschätzt. Auto und Velo von openrouteservice.
+- **Pendelkosten:** ÖV = Jahres-Strecken-Abo aus einer Preistabelle, höchstens das GA. Auto = km × 2 × Bürotage × 46 Wochen × 74 Rp. (bzw. 28 Rp., wenn das Auto schon da ist). Velo = 0 CHF.
 
 ## Machine Learning
 
-_Wird von AP 3 ergänzt._
+Wir nutzen scikit-learn mit zwei Lernarten aus dem Kurs:
+
+1. **Clustering (k-means):** Die Gemeinden innerhalb der maximalen Pendelzeit werden nach Steuern, Miete und Pendelzeit in 10 Gruppen eingeteilt. Aus jeder Gruppe zeigt die App eine Gemeinde zum Bewerten. So bewertet die Nutzerin möglichst unterschiedliche Gemeinden.
+2. **Klassifikation (logistische Regression):** Die Nutzerin bewertet die Gemeinden mit «gefällt» (1) oder «gefällt nicht» (0). Das Modell lernt daraus und sagt für alle Gemeinden voraus, wie wahrscheinlich sie ihr gefallen («Passt zu dir in %»). Die Beträge der Koeffizienten zeigen, wie wichtig ihr Steuern, Miete und Pendelzeit sind.
+
+Vor dem Training werden die Merkmale standardisiert (`StandardScaler`), damit Frankenbeträge und Minuten vergleichbar sind. Unter 6 Bewertungen oder ohne mindestens ein «gefällt» und ein «gefällt nicht» trainiert die App kein Modell und sortiert nur nach Kosten.
 
 ## Einsatz von GenAI
 
-_Welche Tools, wofür, was wir selbst geprüft haben._
+_Welche Tools, wofür, was wir selbst geprüft haben. Der KI-generierte Code ist in jeder Datei oben gekennzeichnet._
 
 ## Team
 
