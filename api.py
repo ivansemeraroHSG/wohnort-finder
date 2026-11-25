@@ -4,6 +4,8 @@ api.py – Arbeitsort und Pendeln: Koordinaten, Pendelzeiten und Pendelkosten (A
 Verantwortlich: Gregor Weber
 KI-Hinweis: Mit Claude (Anthropic) erstellt; am 24.11.2026 mit Claude vereinfacht
 (Branch WF-5.6-Umbau). openrouteservice-Abfrage: umgesetzt im Team, mit Claude kommentiert.
+Am 25.11.2026 mit Claude ergänzt (Branch WF-5.7): alle Verkehrsmittel vergleichen,
+Abo-Wahl, Weg zur Haltestelle, echte ÖV-Zeiten für die Gemeinden, die man in der App sieht.
 
 Genutzte APIs (alle kostenlos):
 - swisstopo SearchServer:  Adresse -> Koordinaten (GET, wie in Übung 6/7)
@@ -35,6 +37,7 @@ ANZAHL_LIVE = 50        # so viele nahe Gemeinden fragen wir live ab (Fair Use d
 PAUSE_SEK = 0.2         # kurze Pause zwischen zwei Abfragen (Fair Use)
 MAX_FEHLER = 3          # so viele Fehler hintereinander: API gestört, wir hören auf
 KEINE_VERBINDUNG = -1   # API hat geantwortet, aber keine passende Verbindung gefunden
+ZUGANG_MIN = 5          # Fussweg von zu Hause zur Haltestelle; der Fahrplan rechnet ab Haltestelle
 
 # Bahn-Betriebspunkte (z. B. Weichen) sind keine Haltestellen. swisstopo schreibt
 # das ins Feld «detail»; solche Treffer überspringen wir.
@@ -184,15 +187,17 @@ def live_oev_minuten(gemeinde_name, gemeinde_lat, gemeinde_lon, ziel):
     return schnellste
 
 
-def oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt=None):
+def oev_zeiten(ziel_lat, ziel_lon, gemeinden, extra_nrs=None, fortschritt=None):
     """
     ÖV-Pendelzeit von jeder Gemeinde zum Arbeitsort.
 
-    Die ANZAHL_LIVE nächsten Gemeinden fragen wir live ab, alle anderen schätzen wir
-    aus der Luftlinie. Echte Zeiten kommen in den Cache, damit wir nicht zweimal fragen.
+    Live abgefragt werden die ANZAHL_LIVE nächsten Gemeinden und alle Gemeinden in
+    extra_nrs (die, die man in der App sieht). Alle anderen schätzen wir aus der Luftlinie.
+    Echte Zeiten kommen in den Cache, damit wir nicht zweimal fragen.
 
     Parameter:
         gemeinden:   DataFrame mit bfs_nr, name, lat, lon
+        extra_nrs:   Liste mit BFS-Nummern, die zusätzlich live abgefragt werden
         fortschritt: optional ein Fortschrittsbalken (st.progress) aus app.py
 
     Rückgabe: DataFrame mit bfs_nr, km, pendel_min, geschaetzt
@@ -219,8 +224,11 @@ def oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt=None):
     for bfs_nr, minuten in zip(cache["bfs_nr"], cache["minuten"]):
         bekannt[bfs_nr] = minuten
 
-    # Schritt 3: Die nächsten Gemeinden live abfragen, wenn sie noch nicht im Cache sind
+    # Schritt 3: Die nächsten Gemeinden und die extra_nrs live abfragen, wenn sie noch nicht im Cache sind
     naechste = resultat.sort_values("luftlinie").head(ANZAHL_LIVE)
+    if extra_nrs is not None:
+        extra = resultat[resultat["bfs_nr"].isin(extra_nrs)]
+        naechste = pd.concat([naechste, extra]).drop_duplicates("bfs_nr")
     fehler_hintereinander = 0
     erledigt = 0
     for bfs_nr, name, lat, lon in zip(naechste["bfs_nr"], naechste["name"], naechste["lat"], naechste["lon"]):
@@ -246,7 +254,7 @@ def oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt=None):
     for index in resultat.index:
         bfs_nr = resultat.loc[index, "bfs_nr"]
         if bfs_nr in bekannt and bekannt[bfs_nr] != KEINE_VERBINDUNG:
-            resultat.loc[index, "pendel_min"] = bekannt[bfs_nr]
+            resultat.loc[index, "pendel_min"] = bekannt[bfs_nr] + ZUGANG_MIN
             resultat.loc[index, "geschaetzt"] = False
 
     return resultat[["bfs_nr", "km", "pendel_min", "geschaetzt"]]
@@ -358,33 +366,92 @@ def route_zeiten(ziel_lat, ziel_lon, gemeinden, verkehrsmittel):
     return resultat[["bfs_nr", "km", "pendel_min", "geschaetzt"]]
 
 
-def pendeln_berechnen(ziel_lat, ziel_lon, gemeinden, verkehrsmittel, buerotage, hat_auto, fortschritt=None):
+def pendeln_berechnen(ziel_lat, ziel_lon, gemeinden, eingaben, extra_nrs=None, fortschritt=None):
     """
-    Pendelzeit und Pendelkosten pro Jahr für alle Gemeinden mit einem Verkehrsmittel.
+    Pendelzeit und Pendelkosten pro Jahr für alle Gemeinden und alle gewählten Verkehrsmittel.
+    Pro Gemeinde wählen wir das beste Verkehrsmittel (siehe bestes_verkehrsmittel).
 
     Parameter:
-        verkehrsmittel: "oev", "auto" oder "velo"
-        buerotage:      Tage pro Woche im Büro (für die Autokosten)
-        hat_auto:       True = Auto ist schon vorhanden
+        eingaben:  Dictionary aus app.py mit verkehrsmittel (Liste), buerotage, hat_auto,
+                   oev_abo und max_pendel
+        extra_nrs: BFS-Nummern, für die wir die ÖV-Zeit sicher live abfragen
 
-    Rückgabe: DataFrame mit bfs_nr, km, pendel_min, geschaetzt, pendel_chf
+    Rückgabe: DataFrame mit bfs_nr, pro Verkehrsmittel <vm>_min, <vm>_chf, <vm>_geschaetzt
+              und für das beste: verkehrsmittel, pendel_min, pendel_chf, geschaetzt
     """
-    if verkehrsmittel == "oev":
-        pendel = oev_zeiten(ziel_lat, ziel_lon, gemeinden, fortschritt)
-    else:
-        pendel = route_zeiten(ziel_lat, ziel_lon, gemeinden, verkehrsmittel)
+    pendel = pd.DataFrame()
+    pendel["bfs_nr"] = gemeinden["bfs_nr"]
 
-    # Kosten pro Jahr für jede Gemeinde
-    kosten = []
-    for km in pendel["km"]:
-        if verkehrsmittel == "oev":
-            kosten.append(oev_kosten(km))
-        elif verkehrsmittel == "auto":
-            kosten.append(auto_kosten(km, buerotage, hat_auto))
+    for vm in eingaben["verkehrsmittel"]:
+        if vm == "oev":
+            zeiten = oev_zeiten(ziel_lat, ziel_lon, gemeinden, extra_nrs, fortschritt)
         else:
-            kosten.append(0)   # Velo fahren kostet (fast) nichts
+            zeiten = route_zeiten(ziel_lat, ziel_lon, gemeinden, vm)
+
+        # Kosten pro Jahr für jede Gemeinde
+        kosten = []
+        for km in zeiten["km"]:
+            if vm == "oev":
+                kosten.append(oev_kosten(km, eingaben["oev_abo"]))
+            elif vm == "auto":
+                kosten.append(auto_kosten(km, eingaben["buerotage"], eingaben["hat_auto"]))
+            else:
+                kosten.append(0)   # Velo fahren kostet (fast) nichts
+
+        # Spalten umbenennen, z. B. pendel_min -> oev_min, und an die Tabelle anhängen
+        spalten = pd.DataFrame()
+        spalten["bfs_nr"] = zeiten["bfs_nr"]
+        spalten[vm + "_min"] = zeiten["pendel_min"]
+        spalten[vm + "_chf"] = kosten
+        spalten[vm + "_geschaetzt"] = zeiten["geschaetzt"]
+        pendel = pendel.merge(spalten, on="bfs_nr")
+
+    # Pro Gemeinde das beste Verkehrsmittel und seine Werte
+    beste = []
+    for index in pendel.index:
+        beste.append(bestes_verkehrsmittel(pendel.loc[index], eingaben["verkehrsmittel"], eingaben["max_pendel"]))
+    pendel["verkehrsmittel"] = beste
+    minuten = []
+    kosten = []
+    geschaetzt = []
+    for index, vm in zip(pendel.index, beste):
+        minuten.append(pendel.loc[index, vm + "_min"])
+        kosten.append(pendel.loc[index, vm + "_chf"])
+        geschaetzt.append(pendel.loc[index, vm + "_geschaetzt"])
+    pendel["pendel_min"] = minuten
     pendel["pendel_chf"] = kosten
+    pendel["geschaetzt"] = geschaetzt
     return pendel
+
+
+def bestes_verkehrsmittel(zeile, verkehrsmittel, max_pendel):
+    """
+    Das beste Verkehrsmittel für eine Gemeinde.
+
+    Regel: Von den Verkehrsmitteln, die innerhalb der maximalen Pendelzeit liegen,
+    nehmen wir das günstigste. Passt keines, nehmen wir das schnellste.
+
+    Parameter:
+        zeile:          eine Zeile aus pendeln_berechnen mit <vm>_min und <vm>_chf
+        verkehrsmittel: Liste der gewählten Verkehrsmittel, z. B. ["oev", "auto"]
+        max_pendel:     maximale Pendelzeit pro Strecke in Minuten
+    """
+    # Zuerst: das schnellste (falls keines in die maximale Pendelzeit passt)
+    schnellstes = verkehrsmittel[0]
+    for vm in verkehrsmittel:
+        if zeile[vm + "_min"] < zeile[schnellstes + "_min"]:
+            schnellstes = vm
+
+    # Dann: das günstigste von denen, die in die maximale Pendelzeit passen
+    guenstigstes = None
+    for vm in verkehrsmittel:
+        if zeile[vm + "_min"] <= max_pendel:
+            if guenstigstes is None or zeile[vm + "_chf"] < zeile[guenstigstes + "_chf"]:
+                guenstigstes = vm
+
+    if guenstigstes is None:
+        return schnellstes
+    return guenstigstes
 
 
 # --- Kurzer Test: läuft nur bei "python api.py", nicht wenn app.py die Datei importiert ---

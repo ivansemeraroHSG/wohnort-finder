@@ -47,6 +47,17 @@ OEV_PREISE = [
 ]
 # Wer weiter fährt, kauft ein GA (2. Klasse, ab Dezember 2026)
 GA_PREIS = 4095
+# Ein Jahres-Abo kostet so viel wie 9 Monats-Abos (Tarif T650). Monats-Abo = Jahrespreis / 9.
+MONATE_PRO_JAHRESABO = 9
+
+# Abo-Auswahl in der App: Schlüssel -> Text für die Nutzerin
+OEV_ABOS = {
+    "guenstigstes": "Günstigstes automatisch (Strecken-Abo oder GA)",
+    "jahr": "Strecken-Abo, jährlich",
+    "monat": "Strecken-Abo, monatlich (monatlich kündbar)",
+    "ga": "GA neu kaufen",
+    "ga_vorhanden": "GA habe ich schon (kostet nichts zusätzlich)",
+}
 
 # Auto, TCS-Kilometerkosten 2026: mit Kauf und Versicherung 74 Rp. pro km,
 # nur Benzin, Unterhalt und Reifen 28 Rp. pro km (wenn man schon ein Auto hat)
@@ -159,12 +170,34 @@ def get_cache_connection():
     return con
 
 
-def oev_kosten(km):
-    """ÖV-Kosten pro Jahr in CHF: Jahres-Strecken-Abo aus der Tabelle OEV_PREISE, sonst GA."""
+def jahresabo_preis(km):
+    """Preis eines Jahres-Strecken-Abos in CHF aus der Tabelle OEV_PREISE (zu weit: GA-Preis)."""
     for bis_km, preis in OEV_PREISE:
         if km <= bis_km:
             return preis
     return GA_PREIS
+
+
+def oev_kosten(km, abo="guenstigstes"):
+    """
+    ÖV-Kosten pro Jahr in CHF.
+
+    Parameter:
+        km:  Strecken-km (eine Fahrt)
+        abo: ein Schlüssel aus OEV_ABOS
+    """
+    jahresabo = jahresabo_preis(km)
+    if abo == "ga_vorhanden":
+        return 0
+    if abo == "ga":
+        return GA_PREIS
+    if abo == "monat":
+        # 12 Monats-Abos; ein Monats-Abo kostet einen Neuntel des Jahres-Abos
+        return round(12 * jahresabo / MONATE_PRO_JAHRESABO)
+    if abo == "jahr":
+        return jahresabo
+    # "guenstigstes": das Jahres-Abo oder das GA, je nachdem was billiger ist
+    return min(jahresabo, GA_PREIS)
 
 
 def auto_kosten(km, buerotage, hat_auto):
@@ -190,5 +223,6 @@ if __name__ == "__main__":
     print(get_municipalities().head())
     print(get_tax(125000, "ledig").head())
     print(get_rent(3).head())
-    print("ÖV 12 km:", oev_kosten(12), "CHF, ÖV 200 km:", oev_kosten(200), "CHF")
+    for abo in OEV_ABOS:
+        print("ÖV 12 km,", abo, ":", oev_kosten(12, abo), "CHF")
     print("Auto 20 km, 5 Tage:", auto_kosten(20, 5, False), "CHF")
