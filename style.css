@@ -1,0 +1,87 @@
+/*
+  style.css – Aussehen der eigenen HTML-Bausteine in app.py (Arbeitspaket 4/5).
+  Verantwortlich: Ivan. KI-Hinweis: mit Claude (Anthropic) erstellt, angepasst von Ivan.
+  app.py lädt diese Datei einmal mit st.html(). Farben wie in .streamlit/config.toml.
+  Achtung: keine spitzen Klammern in dieser Datei, auch nicht in Kommentaren. Streamlit hält
+  sie für HTML-Tags und lädt dann das ganze CSS nicht.
+*/
+
+:root {
+  --papier: #f7f4ee;
+  --flaeche: #fffdf8;
+  --tinte: #22211e;
+  --grau: #8a857a;
+  --linie: #d9d2c3;
+  --gruen: #2f6b4f;
+  --terrakotta: #b5532a;
+}
+
+/* Zahlen gleich breit, damit sie sauber untereinander stehen */
+.zahl, .tabelle td, .karte td { font-variant-numeric: tabular-nums; }
+
+/* ---------- Schrittanzeige oben ---------- */
+.schritte { display: flex; justify-content: center; align-items: center; gap: 0.75rem; margin: 0.25rem 0 1.75rem; }
+.schritt { display: flex; align-items: center; gap: 0.45rem; color: var(--grau); font-size: 0.95rem; }
+.schritt .nr {
+  width: 1.65rem; height: 1.65rem; border-radius: 50%; border: 1.5px solid var(--linie);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 0.85rem;
+}
+.schritt.aktiv { color: var(--tinte); font-weight: 600; }
+.schritt.aktiv .nr { background: var(--gruen); border-color: var(--gruen); color: var(--papier); }
+.schritt.fertig { color: var(--gruen); }
+.schritt.fertig .nr { border-color: var(--gruen); }
+.verbindung { width: 2.5rem; height: 1.5px; background: var(--linie); }
+
+/* ---------- Referenz: heutiger Wohnort ---------- */
+.referenz {
+  border-left: 3px solid var(--tinte); padding: 0.5rem 0 0.5rem 0.9rem; margin: 0.5rem 0 1.25rem;
+  color: var(--tinte);
+}
+.referenz .titel { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--grau); }
+
+/* ---------- Karte einer Gemeinde (Bewerten) ---------- */
+.karte {
+  background: var(--flaeche); border: 1px solid var(--linie); border-radius: 6px;
+  padding: 0.9rem 1rem 0.6rem; margin-bottom: 0.4rem;
+}
+.karte.gefaellt { border-color: var(--gruen); box-shadow: inset 4px 0 0 var(--gruen); }
+.karte.gefaellt-nicht { border-color: var(--terrakotta); box-shadow: inset 4px 0 0 var(--terrakotta); }
+.karte .kopf { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.5rem; }
+.karte .name { font-family: "Source Serif 4", serif; font-size: 1.2rem; font-weight: 600; }
+.karte .kanton { color: var(--grau); font-size: 0.85rem; }
+.karte table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.karte td { padding: 0.22rem 0; border-top: 1px solid #eee8dc; }
+.karte td.wert { text-align: right; }
+.karte td.diff { text-align: right; width: 5.5rem; font-size: 0.85rem; }
+.karte tr.total td { font-weight: 600; border-top: 1px solid var(--linie); }
+
+/* Unterschied zum heutigen Wohnort: grün = besser, terrakotta = schlechter */
+.besser { color: var(--gruen); }
+.schlechter { color: var(--terrakotta); }
+
+/* ---------- Ergebnis-Box ---------- */
+.ergebnis {
+  background: var(--flaeche); border: 1px solid var(--linie); border-top: 4px solid var(--gruen);
+  border-radius: 6px; padding: 1.2rem 1.4rem; margin: 0.5rem 0 1.5rem;
+}
+.ergebnis .titel { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--grau); }
+.ergebnis .gross { font-family: "Source Serif 4", serif; font-size: 1.9rem; font-weight: 600; margin: 0.15rem 0 0.4rem; }
+.ergebnis .zusatz { color: var(--tinte); }
+
+/* ---------- Tabellen (Vergleich und Rangliste) ---------- */
+.tabelle { width: 100%; border-collapse: collapse; font-size: 0.93rem; margin-bottom: 0.5rem; }
+.tabelle th {
+  text-align: right; font-weight: 500; color: var(--grau); font-size: 0.82rem;
+  border-bottom: 1.5px solid var(--tinte); padding: 0.4rem 0.6rem;
+}
+.tabelle td { text-align: right; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--linie); }
+.tabelle th:first-child, .tabelle td:first-child { text-align: left; }
+.tabelle tr.summe td { font-weight: 600; border-top: 1.5px solid var(--tinte); }
+.tabelle .klein { color: var(--grau); font-size: 0.82rem; }
+
+/* «Gefällt nicht» ausgewählt: terrakotta statt grün (Streamlit gibt jedem Knopf die Klasse st-key- plus seinen key) */
+[class*="st-key-nein_"] button[kind="primary"] { background: var(--terrakotta); border-color: var(--terrakotta); }
+
+/* Rangliste: Platz und Gemeinde links, Zahlen rechts */
+.rangliste th:nth-child(2), .rangliste td:nth-child(2) { text-align: left; }
+.rangliste td:first-child { color: var(--grau); width: 2rem; }
